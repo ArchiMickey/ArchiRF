@@ -163,23 +163,16 @@ class MMDiTBlock(nn.Module):
         self.mlp_2 = Mlp(
             in_features=dim, hidden_features=mlp_dim, act_layer=approx_gelu, drop=0
         )
-        self.adaLN_modulation = nn.Sequential(nn.SiLU(), nn.Linear(dim, 12 * dim))
+        self.adaLN_modulation_1 = nn.Sequential(nn.SiLU(), nn.Linear(dim, 6 * dim))
+        self.adaLN_modulation_2 = nn.Sequential(nn.SiLU(), nn.Linear(dim, 6 * dim))
 
     def forward(self, x, c, global_c):
-        (
-            shift_msa_1,
-            scale_msa_1,
-            gate_msa_1,
-            shift_mlp_1,
-            scale_mlp_1,
-            gate_mlp_1,
-            shift_msa_2,
-            scale_msa_2,
-            gate_msa_2,
-            shift_mlp_2,
-            scale_mlp_2,
-            gate_mlp_2,
-        ) = self.adaLN_modulation(global_c).chunk(12, dim=-1)
+        (shift_msa_1, scale_msa_1, gate_msa_1, shift_mlp_1, scale_mlp_1, gate_mlp_1) = (
+            self.adaLN_modulation_1(global_c).chunk(6, dim=-1)
+        )
+        (shift_msa_2, scale_msa_2, gate_msa_2, shift_mlp_2, scale_mlp_2, gate_mlp_2) = (
+            self.adaLN_modulation_2(global_c).chunk(6, dim=-1)
+        )
         attn_1, attn_2 = self.attn(
             modulate(self.norm1_1(x), scale_msa_1, shift_msa_1),
             modulate(self.norm1_2(c), scale_msa_2, shift_msa_2),
@@ -288,8 +281,10 @@ class MMDiT(nn.Module):
 
         # Zero-out adaLN modulation layers in DiT blocks:
         for block in self.blocks:
-            nn.init.constant_(block.adaLN_modulation[-1].weight, 0)
-            nn.init.constant_(block.adaLN_modulation[-1].bias, 0)
+            nn.init.constant_(block.adaLN_modulation_1[-1].weight, 0)
+            nn.init.constant_(block.adaLN_modulation_1[-1].bias, 0)
+            nn.init.constant_(block.adaLN_modulation_2[-1].weight, 0)
+            nn.init.constant_(block.adaLN_modulation_2[-1].bias, 0)
 
         # Zero-out output layers:
         nn.init.constant_(self.final_layer.adaLN_modulation[-1].weight, 0)
