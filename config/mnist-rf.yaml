@@ -46,7 +46,6 @@ trainer:
     mixed_precision: bf16
     log_with: wandb
   log_dir: ./logs/mnist/rf
-  sample_batch_size: 256
   save_and_sample_interval: 1000
   n_per_class: 10
   fid_stats_dir: ./results/mnist

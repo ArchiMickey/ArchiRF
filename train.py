@@ -2,6 +2,8 @@ import hydra
 from hydra.utils import instantiate
 from icecream import install
 from omegaconf import OmegaConf
+from rich import print as rprint
+from torchinfo import summary
 from accelerate.utils import set_seed
 
 install()
@@ -14,6 +16,7 @@ def main(cfg):
     dm = instantiate(cfg.datamodule)(**cfg.hparams)
     dl = dm.get_dataloader()
     model = instantiate(cfg.model)
+    rprint(summary(model, verbose=0))
     optimizer = instantiate(cfg.optimizer)(model.net.parameters())
     lr_scheduler = None
     if "lr_scheduler" in cfg:

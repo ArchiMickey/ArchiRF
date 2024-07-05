@@ -16,6 +16,7 @@ class RectifiedFlow(nn.Module):
         channels=3,
         image_size=32,
         logit_normal_sampling_t=False,
+        normalize_input_output=True
     ):
         super().__init__()
         self.net = net
@@ -23,6 +24,7 @@ class RectifiedFlow(nn.Module):
         self.channels = channels
         self.image_size = image_size
         self.logit_normal_sampling_t = logit_normal_sampling_t
+        self.normalize_input_output = normalize_input_output
 
     def forward(self, x, c=None):
         if self.use_cond:
@@ -35,7 +37,8 @@ class RectifiedFlow(nn.Module):
 
         t_ = rearrange(t, "b -> b 1 1 1")
         z = torch.randn_like(x)
-        x = normalize_to_neg1_1(x)
+        if self.normalize_input_output:
+            x = normalize_to_neg1_1(x)
         z_t = (1 - t_) * x + t_ * z
         v_t = self.net(z_t, t, c)
         target = z - x
@@ -55,10 +58,13 @@ class RectifiedFlow(nn.Module):
             z = z - v_t / sampling_steps
             images.append(z)
 
-        z = unnormalize_to_0_1(z.clip(-1, 1))
+        if self.normalize_input_output:
+            z = unnormalize_to_0_1(z.clip(-1, 1))
 
         if return_all_steps:
-            return z, unnormalize_to_0_1(torch.stack(images).clip(-1, 1))
+            if self.normalize_input_output:
+                all_steps = unnormalize_to_0_1(torch.stack(images).clip(-1, 1))
+            return z, all_steps
         return z
 
     @torch.inference_mode()
@@ -105,6 +111,8 @@ class LatentRectifiedFlow(RectifiedFlow):
     ):
         super().__init__(net, channels, image_size, logit_normal_sampling_t)
         self.vae = AutoencoderKL.from_pretrained("stabilityai/sdxl-vae")
+        for p in self.vae.parameters():
+            p.requires_grad = False
         
     @torch.inference_mode()
     def encode(self, x):
@@ -124,8 +132,8 @@ class LatentRectifiedFlow(RectifiedFlow):
             t = torch.rand((x.shape[0],), device=x.device)
 
         t_ = rearrange(t, "b -> b 1 1 1")
-        x = normalize_to_neg1_1(x)
-        x = self.encode(x)
+        # x = normalize_to_neg1_1(x)
+        # x = self.encode(x)
         z = torch.randn_like(x)
         z_t = (1 - t_) * x + t_ * z
         v_t = self.net(z_t, t, c)

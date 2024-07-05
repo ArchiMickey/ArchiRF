@@ -31,7 +31,6 @@ class Block(nn.Module):
         self.act = nn.SiLU()
 
     def forward(self, x, scale_shift=None):
-        x = self.conv(x)
         x = self.norm(x)
 
         if scale_shift is not None:
@@ -39,6 +38,7 @@ class Block(nn.Module):
             x = x * (1 + scale) + shift
 
         x = self.act(x)
+        x = self.conv(x)
         return x
 
 
@@ -270,7 +270,7 @@ class UNetModel(nn.Module):
                     layers.append(Upsample())
                 self.ups.append(TimestepEmbedSequential(*layers))
 
-        self.out = nn.Conv2d(channels, out_channels, 3, padding=1)
+        self.out = Block(channels, out_channels)
 
     def forward(self, x, t, y=None):
         hs = []

@@ -2,9 +2,9 @@ hparams:
   seed: 42
   batch_size: 128
   grad_accumulate_every: 1
-  lr: 2e-4
+  lr: 1e-4
   # max_grad_norm: torch.inf
-  n_steps: 200000
+  n_steps: 400000
   use_ema: true
   ema_decay: 0.9999
 
@@ -13,7 +13,7 @@ datamodule:
   _target_: data.data_utils.ExperimentDataModule
   dataset_name: cifar10
   random_horizonal_flip: true
-  root: ./data
+  root: /mnt/g
   image_size: 32
   num_workers: 8
 
@@ -39,7 +39,10 @@ optimizer:
   lr: ${hparams.lr}
   weight_decay: 0.
 
-project_name: flow-experiment
+lr_scheduler:
+  _partial_: true
+  _target_: modules.utils.LinearWarmupLRSched
+  warmup_steps: 1000
 
 trainer:
   _partial_: true
@@ -49,7 +52,6 @@ trainer:
     mixed_precision: bf16
     log_with: wandb
   log_dir: ./logs/cifar10/rf
-  sample_batch_size: 256
   sampling_steps: 50
   save_and_sample_interval: 20000
   n_per_class: 10
@@ -58,7 +60,7 @@ trainer:
   fid_cfg_scale: 1.5
   num_fid_samples: 50000
   logger_kwargs:
-    project_name: flow-experiment
+    project_name: RF-Experiments
     init_kwargs:
       wandb:
-        name: cifar10_rf
+        name: cifar10-rf-unet

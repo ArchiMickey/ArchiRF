@@ -173,12 +173,12 @@ class MMDiTBlock(nn.Module):
         (shift_msa_2, scale_msa_2, gate_msa_2, shift_mlp_2, scale_mlp_2, gate_mlp_2) = (
             self.adaLN_modulation_2(global_c).chunk(6, dim=-1)
         )
-        attn_1, attn_2 = self.attn(
+        attn_x, attn_c = self.attn(
             modulate(self.norm1_1(x), scale_msa_1, shift_msa_1),
             modulate(self.norm1_2(c), scale_msa_2, shift_msa_2),
         )
-        x = x + gate_msa_1.unsqueeze(1) * attn_1
-        c = c + gate_msa_2.unsqueeze(1) * attn_2
+        x = x + gate_msa_1.unsqueeze(1) * attn_x
+        c = c + gate_msa_2.unsqueeze(1) * attn_c
 
         x = x + gate_mlp_1.unsqueeze(1) * self.mlp_1(
             modulate(self.norm2_1(x), scale_mlp_1, shift_mlp_1)

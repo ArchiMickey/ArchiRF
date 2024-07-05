@@ -1,41 +1,43 @@
 hparams:
   seed: 42
   batch_size: 64
-  grad_accumulate_every: 2
-  lr: 2e-4
-  # max_grad_norm: torch.inf
-  n_steps: 200000
+  grad_accumulate_every: 4
+  lr: 1e-4
+  max_grad_norm: 1.
+  n_steps: 400000
   use_ema: true
   ema_decay: 0.9999
 
 datamodule:
   _partial_: true
-  _target_: data.data_utils.ExperimentDataModule
-  dataset_name: imagenet
-  random_horizonal_flip: true
-  root: /mnt/g/ImageNet
-  image_size: 256
+  _target_: data.data_utils.LatentImageDataModule
+  root: /mnt/g/artbench-10-imagefolder-split/train
+  dataset_name: imagefolder
   num_workers: 8
 
 model:
   _target_: models.rf.LatentRectifiedFlow
-  channels: 3
+  channels: 4
   image_size: 32
   logit_normal_sampling_t: true
   net:
-    _target_: modules.networks_karras_unet.KarrasUnet
-    dim: 128
-    dim_max: 512
-    channels: 4
-    num_blocks_per_stage: 2
-    num_classes: 1000
-    attn_dim_head: 32
+    _target_: modules.networks_mmdit.MMDiT
+    in_channels: 4
+    dim: 384
+    depth: 6
+    num_heads: 6
+    num_classes: 10
 
 optimizer:
   _partial_: true
   _target_: bitsandbytes.optim.AdamW8bit
   lr: ${hparams.lr}
   weight_decay: 0.
+
+lr_scheduler:
+  _partial_: true
+  _target_: modules.utils.LinearWarmupLRSched
+  warmup_steps: 1000
 
 trainer:
   _partial_: true
@@ -44,16 +46,15 @@ trainer:
     _target_: accelerate.Accelerator
     mixed_precision: bf16
     log_with: wandb
-  log_dir: ./logs/imagenet/rf/karras_unet
+  log_dir: ./logs/artbench10/lrf
   sampling_steps: 50
   save_and_sample_interval: 20000
-  n_per_class: 10
-  fid_eval_interval: 100000
-  fid_stats_dir: ./results/imagenet
+  fid_eval_interval: 1e9
+  fid_stats_dir: ./results/artbench10
   fid_cfg_scale: 1.5
   num_fid_samples: 50000
   logger_kwargs:
-    project_name: mmdit
+    project_name: RF-Experiments
     init_kwargs:
       wandb:
-        name: imagenet_rf
+        name: artbench10-lrf-mmdit

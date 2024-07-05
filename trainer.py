@@ -43,9 +43,9 @@ class Trainer:
         ema_decay=0.9999,
         # misc
         log_dir=None,
-        sample_batch_size=1,
         sampling_steps=100,
-        save_and_sample_interval=1000,
+        save_interval=1000,
+        sample_interval=1000,
         n_per_class=10,
         fid_eval_interval=10000,
         fid_stats_dir="./results",
@@ -66,9 +66,9 @@ class Trainer:
         self.max_grad_norm = max_grad_norm
         self.n_steps = n_steps
 
-        self.sample_batch_size = sample_batch_size
+        self.save_interval = save_interval
         self.sampling_steps = sampling_steps
-        self.save_and_sample_interval = save_and_sample_interval
+        self.sample_interval = sample_interval
         self.n_per_class = n_per_class
 
         self.use_ema = use_ema
@@ -79,7 +79,7 @@ class Trainer:
         self.num_fid_samples = num_fid_samples
         self.fid_cfg_scale = fid_cfg_scale
         self.fid_scorer = FIDEvaluation(
-            self.sample_batch_size,
+            self.batch_size,
             self.dl,
             self.model,
             self.model.channels,
@@ -159,7 +159,10 @@ class Trainer:
                 total_loss = 0.0
                 for _ in range(self.grad_accumulate_every):
                     data = next(self.dl)
-                    x, c = data
+                    if "latent" not in data:
+                        x, c = data["img"], data["label"]
+                    else:
+                        x, c = data["latent"], data["label"]
                     x, c = x.to(self.device), c.to(self.device)
 
                     with self.accelerator.autocast():
@@ -185,11 +188,13 @@ class Trainer:
                 if self.lr_scheduler is not None:
                     self.lr_scheduler.step()
 
-                if self.step % self.save_and_sample_interval == 0:
+                if self.step % self.save_interval == 0:
+                    self.save_ckpt()
+                
+                if self.step % self.sample_interval == 0:
                     self.model.eval()
                     with self.accelerator.autocast():
                         self.log_samples()
-                    self.save_ckpt()
                     self.model.train()
 
                 if self.step % self.fid_eval_interval == 0:
@@ -210,11 +215,16 @@ class Trainer:
                 logging_images = []
                 logging_animations = []
                 for cfg_scale in [1.0, 1.25, 1.5]:
-                    nrow = self.model.net.num_classes
-                    y = torch.arange(0, self.model.net.num_classes).repeat(
-                        self.n_per_class
-                    )
-                    batch_y = y.split(self.sample_batch_size)
+                    num_classes = self.model.net.num_classes
+                    if num_classes <= 10:
+                        nrow = num_classes
+                        y = torch.arange(0, self.model.net.num_classes).repeat(
+                            self.n_per_class
+                        )
+                    else:
+                        nrow = 4
+                        y = torch.randint(0, self.model.net.num_classes, (16,))
+                    batch_y = y.split(self.batch_size)
                     samples = []
                     samples_each_step = []
 
@@ -242,7 +252,7 @@ class Trainer:
 
                     samples_each_step = torch.cat(samples_each_step)
                     frames = [
-                        make_grid(s, nrow=nrow).permute(1, 2, 0).cpu().numpy() * 255
+                        make_grid(s.float(), nrow=nrow).permute(1, 2, 0).cpu().numpy() * 255
                         for s in samples_each_step
                     ]
                     clip = mpy.ImageSequenceClip(frames, fps=10)
@@ -274,7 +284,7 @@ class Trainer:
                     )
 
             else:
-                batch_batch_size = num_to_groups(100, self.sample_batch_size)
+                batch_batch_size = num_to_groups(100, self.batch_size)
                 samples = []
                 samples_each_step = []
 

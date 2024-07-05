@@ -53,7 +53,6 @@ trainer:
     mixed_precision: bf16
     log_with: wandb
   log_dir: ./logs/cifar10/rf/karras_unet
-  sample_batch_size: 256
   sampling_steps: 50
   save_and_sample_interval: 20000
   # save_and_sample_interval: 1

@@ -249,7 +249,7 @@ class DiT(nn.Module):
 
     def forward_with_cfg(self, x, t, y, cfg_scale):
         x = x.repeat(2, 1, 1, 1)
-        t = t.repeat(x.shape[0])
+        t = t.repeat(2)
         y = y.repeat(2)
         y[len(x) // 2:] = self.y_embedder.num_classes
         

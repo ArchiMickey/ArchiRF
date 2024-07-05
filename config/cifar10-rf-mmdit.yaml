@@ -3,8 +3,8 @@ hparams:
   batch_size: 128
   grad_accumulate_every: 1
   lr: 1e-4
-  # max_grad_norm: torch.inf
-  n_steps: 400000
+  max_grad_norm: 1.
+  n_steps: 200000
   use_ema: true
   ema_decay: 0.9999
 
@@ -26,7 +26,7 @@ model:
     _target_: modules.networks_mmdit.MMDiT
     in_channels: 3
     dim: 384
-    depth: 12
+    depth: 6
     num_heads: 6
     num_classes: 10
 
@@ -48,7 +48,6 @@ trainer:
     mixed_precision: bf16
     log_with: wandb
   log_dir: ./logs/cifar10/rf/mmdit
-  sample_batch_size: 256
   sampling_steps: 50
   save_and_sample_interval: 20000
   n_per_class: 10
