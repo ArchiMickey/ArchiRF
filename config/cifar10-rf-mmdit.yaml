@@ -2,9 +2,9 @@ hparams:
   seed: 42
   batch_size: 128
   grad_accumulate_every: 1
-  lr: 1e-4
-  max_grad_norm: 1.
-  n_steps: 200000
+  lr: 2e-4
+  # max_grad_norm: 1.
+  n_steps: 400000
   use_ema: true
   ema_decay: 0.9999
 
@@ -37,7 +37,7 @@ optimizer:
 
 lr_scheduler:
   _partial_: true
-  _target_: modules.utils.LinearWarmupLRSched
+  _target_: modules.lr_scheduler.LinearWarmupLRSched
   warmup_steps: 1000
 
 trainer:
@@ -49,7 +49,8 @@ trainer:
     log_with: wandb
   log_dir: ./logs/cifar10/rf/mmdit
   sampling_steps: 50
-  save_and_sample_interval: 20000
+  save_interval: 50000
+  sample_interval: 20000
   n_per_class: 10
   fid_eval_interval: 100000
   fid_stats_dir: ./results/cifar10

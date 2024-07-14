@@ -1,0 +1,77 @@
+hparams:
+  seed: 42
+  batch_size: 32
+  grad_accumulate_every: 1
+  lr_g: 1e-4
+  lr_d: 1e-4
+  disc_start: 50000
+  disc_factor: 1.0
+  disc_weight: 0.125
+  var_weight: 0.01
+  # max_grad_norm: torch.inf
+  n_steps: 400000
+  use_ema: true
+  ema_decay: 0.9999
+
+datamodule:
+  _partial_: true
+  _target_: data_utils.ImageNetDataModule
+  random_horizonal_flip: true
+  root: /mnt/g/ImageNet
+  image_size: 64
+  num_workers: 20
+
+generator:
+  _target_: model.Autoencoder
+  in_channels: 3
+  channels: 128
+  channel_mult: [1, 2, 2, 2]
+  n_res_blocks: 2
+  z_channels: 16
+
+discriminator:
+  _target_: modules.discriminator.NLayerDiscriminator
+
+optimizer_g:
+  _partial_: true
+  _target_: bitsandbytes.optim.Adam8bit
+  lr: ${hparams.lr_g}
+
+optimizer_d:
+  _partial_: true
+  _target_: bitsandbytes.optim.Adam8bit
+  lr: ${hparams.lr_d}
+
+loss_fn:
+  _target_: loss_fn.LPIPSWithDiscriminator
+  disc_start: ${hparams.disc_start}
+  disc_factor: ${hparams.disc_factor}
+  disc_weight: ${hparams.disc_weight}
+  var_weight: ${hparams.var_weight}
+
+lr_scheduler_g:
+  _partial_: true
+  _target_: modules.lr_scheduler.LinearWarmupLRSched
+  warmup_steps: 1000
+
+lr_scheduler_d:
+  _partial_: true
+  _target_: modules.lr_scheduler.LinearWarmupLRSched
+  warmup_steps: 1
+
+trainer:
+  _partial_: true
+  _target_: trainer.GANTrainer
+  accelerator:
+    _target_: accelerate.Accelerator
+    mixed_precision: bf16
+    log_with: wandb
+  log_dir: ./logs/imagenet/
+  save_interval: 50000
+  sample_interval: 20000
+  validate_interval: 100000
+  logger_kwargs:
+    project_name: ImageNet-AutoencoderKL
+    init_kwargs:
+      wandb:
+        name: imagenet-autoencoder-64x64

@@ -1,783 +1,341 @@
-"""
-the magnitude-preserving unet proposed in https://arxiv.org/abs/2312.02696 by Karras et al.
-"""
+# Copyright (c) 2024, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+#
+# This work is licensed under a Creative Commons
+# Attribution-NonCommercial-ShareAlike 4.0 International License.
+# You should have received a copy of the license along with this
+# work. If not, see http://creativecommons.org/licenses/by-nc-sa/4.0/
 
-import math
-from math import sqrt, ceil
-from functools import partial
+"""Improved diffusion model architecture proposed in the paper
+"Analyzing and Improving the Training Dynamics of Diffusion Models"."""
 
+import numpy as np
 import torch
-from torch import nn, einsum
-from torch.nn import Module, ModuleList
-from torch.optim.lr_scheduler import LambdaLR
-import torch.nn.functional as F
+import torch.nn as nn
 
-from einops import rearrange, repeat, pack, unpack
+#----------------------------------------------------------------------------
+# Normalize given tensor to unit magnitude with respect to the given
+# dimensions. Default = all dimensions except the first.
 
-# helpers functions
+def normalize(x, dim=None, eps=1e-4):
+    if dim is None:
+        dim = list(range(1, x.ndim))
+    norm = torch.linalg.vector_norm(x, dim=dim, keepdim=True, dtype=torch.float32)
+    norm = torch.add(eps, norm, alpha=np.sqrt(norm.numel() / x.numel()))
+    return x / norm.to(x.dtype)
 
+#----------------------------------------------------------------------------
+# Cached construction of constant tensors. Avoids CPU=>GPU copy when the
+# same constant is used multiple times.
 
-def exists(x):
-    return x is not None
+_constant_cache = dict()
 
+def constant(value, shape=None, dtype=None, device=None, memory_format=None):
+    value = np.asarray(value)
+    if shape is not None:
+        shape = tuple(shape)
+    if dtype is None:
+        dtype = torch.get_default_dtype()
+    if device is None:
+        device = torch.device('cpu')
+    if memory_format is None:
+        memory_format = torch.contiguous_format
 
-def default(val, d):
-    if exists(val):
-        return val
-    return d() if callable(d) else d
+    key = (value.shape, value.dtype, value.tobytes(), shape, dtype, device, memory_format)
+    tensor = _constant_cache.get(key, None)
+    if tensor is None:
+        tensor = torch.as_tensor(value.copy(), dtype=dtype, device=device)
+        if shape is not None:
+            tensor, _ = torch.broadcast_tensors(tensor, torch.empty(shape))
+        tensor = tensor.contiguous(memory_format=memory_format)
+        _constant_cache[key] = tensor
+    return tensor
 
+#----------------------------------------------------------------------------
+# Variant of constant() that inherits dtype and device from the given
+# reference tensor by default.
 
-def xnor(x, y):
-    return not (x ^ y)
+def const_like(ref, value, shape=None, dtype=None, device=None, memory_format=None):
+    if dtype is None:
+        dtype = ref.dtype
+    if device is None:
+        device = ref.device
+    return constant(value, shape=shape, dtype=dtype, device=device, memory_format=memory_format)
 
+#----------------------------------------------------------------------------
+# Upsample or downsample the given tensor with the given filter,
+# or keep it as is.
 
-def append(arr, el):
-    arr.append(el)
+def resample(x, f=[1,1], mode='keep'):
+    if mode == 'keep':
+        return x
+    f = np.float32(f)
+    assert f.ndim == 1 and len(f) % 2 == 0
+    pad = (len(f) - 1) // 2
+    f = f / f.sum()
+    f = np.outer(f, f)[np.newaxis, np.newaxis, :, :]
+    f = const_like(x, f)
+    c = x.shape[1]
+    if mode == 'down':
+        return torch.nn.functional.conv2d(x, f.tile([c, 1, 1, 1]), groups=c, stride=2, padding=(pad,))
+    assert mode == 'up'
+    return torch.nn.functional.conv_transpose2d(x, (f * 4).tile([c, 1, 1, 1]), groups=c, stride=2, padding=(pad,))
 
+#----------------------------------------------------------------------------
+# Magnitude-preserving SiLU (Equation 81).
 
-def prepend(arr, el):
-    arr.insert(0, el)
+def mp_silu(x):
+    return torch.nn.functional.silu(x) / 0.596
 
+#----------------------------------------------------------------------------
+# Magnitude-preserving sum (Equation 88).
 
-def pack_one(t, pattern):
-    return pack([t], pattern)
+def mp_sum(a, b, t=0.5):
+    return a.lerp(b.to(a.dtype), t) / np.sqrt((1 - t) ** 2 + t ** 2)
 
+#----------------------------------------------------------------------------
+# Magnitude-preserving concatenation (Equation 103).
 
-def unpack_one(t, ps, pattern):
-    return unpack(t, ps, pattern)[0]
+def mp_cat(a, b, dim=1, t=0.5):
+    Na = a.shape[dim]
+    Nb = b.shape[dim]
+    C = np.sqrt((Na + Nb) / ((1 - t) ** 2 + t ** 2))
+    wa = C / np.sqrt(Na) * (1 - t)
+    wb = C / np.sqrt(Nb) * t
+    return torch.cat([wa * a , wb * b], dim=dim)
 
+#----------------------------------------------------------------------------
+# Magnitude-preserving Fourier features (Equation 75).
 
-def cast_tuple(t, length=1):
-    if isinstance(t, tuple):
-        return t
-    return (t,) * length
-
-
-def divisible_by(numer, denom):
-    return (numer % denom) == 0
-
-
-# in paper, they use eps 1e-4 for pixelnorm
-
-
-def l2norm(t, dim=-1, eps=1e-12):
-    return F.normalize(t, dim=dim, eps=eps)
-
-
-# mp activations
-# section 2.5
-
-
-class MPSiLU(Module):
-    def forward(self, x):
-        return F.silu(x) / 0.596
-
-
-# gain - layer scaling
-
-
-class Gain(Module):
-    def __init__(self):
+class MPFourier(torch.nn.Module):
+    def __init__(self, num_channels, bandwidth=1):
         super().__init__()
-        self.gain = nn.Parameter(torch.tensor(0.0))
-
-    def forward(self, x):
-        return x * self.gain
-
-
-# magnitude preserving concat
-# equation (103) - default to 0.5, which they recommended
-
-
-class MPCat(Module):
-    def __init__(self, t=0.5, dim=-1):
-        super().__init__()
-        self.t = t
-        self.dim = dim
-
-    def forward(self, a, b):
-        dim, t = self.dim, self.t
-        Na, Nb = a.shape[dim], b.shape[dim]
-
-        C = sqrt((Na + Nb) / ((1.0 - t) ** 2 + t**2))
-
-        a = a * (1.0 - t) / sqrt(Na)
-        b = b * t / sqrt(Nb)
-
-        return C * torch.cat((a, b), dim=dim)
-
-
-# magnitude preserving sum
-# equation (88)
-# empirically, they found t=0.3 for encoder / decoder / attention residuals
-# and for embedding, t=0.5
-
-
-class MPAdd(Module):
-    def __init__(self, t):
-        super().__init__()
-        self.t = t
-
-    def forward(self, x, res):
-        a, b, t = x, res, self.t
-        num = a * (1.0 - t) + b * t
-        den = sqrt((1 - t) ** 2 + t**2)
-        return num / den
-
-
-# pixelnorm
-# equation (30)
-
-
-class PixelNorm(Module):
-    def __init__(self, dim, eps=1e-4):
-        super().__init__()
-        # high epsilon for the pixel norm in the paper
-        self.dim = dim
-        self.eps = eps
+        self.register_buffer('freqs', 2 * np.pi * torch.randn(num_channels) * bandwidth)
+        self.register_buffer('phases', 2 * np.pi * torch.rand(num_channels))
 
     def forward(self, x):
-        dim = self.dim
-        return l2norm(x, dim=dim, eps=self.eps) * sqrt(x.shape[dim])
+        y = x.to(torch.float32)
+        y = y.ger(self.freqs.to(torch.float32))
+        y = y + self.phases.to(torch.float32)
+        y = y.cos() * np.sqrt(2)
+        return y.to(x.dtype)
 
+#----------------------------------------------------------------------------
+# Magnitude-preserving convolution or fully-connected layer (Equation 47)
+# with force weight normalization (Equation 66).
 
-# forced weight normed conv2d and linear
-# algorithm 1 in paper
-
-
-def normalize_weight(weight, eps=1e-4):
-    weight, ps = pack_one(weight, "o *")
-    normed_weight = l2norm(weight, eps=eps)
-    normed_weight = normed_weight * sqrt(weight.numel() / weight.shape[0])
-    return unpack_one(normed_weight, ps, "o *")
-
-
-class Conv2d(Module):
-    def __init__(
-        self,
-        dim_in,
-        dim_out,
-        kernel_size,
-        eps=1e-4,
-        concat_ones_to_input=False,  # they use this in the input block to protect against loss of expressivity due to removal of all biases, even though they claim they observed none
-    ):
+class MPConv(torch.nn.Module):
+    def __init__(self, in_channels, out_channels, kernel):
         super().__init__()
-        weight = torch.randn(
-            dim_out, dim_in + int(concat_ones_to_input), kernel_size, kernel_size
-        )
-        self.weight = nn.Parameter(weight)
+        self.out_channels = out_channels
+        self.weight = torch.nn.Parameter(torch.randn(out_channels, in_channels, *kernel))
 
-        self.eps = eps
-        self.fan_in = dim_in * kernel_size**2
-        self.concat_ones_to_input = concat_ones_to_input
-
-    def forward(self, x):
-
+    def forward(self, x, gain=1):
+        w = self.weight.to(torch.float32)
         if self.training:
             with torch.no_grad():
-                normed_weight = normalize_weight(self.weight, eps=self.eps)
-                self.weight.copy_(normed_weight)
+                self.weight.copy_(normalize(w)) # forced weight normalization
+        w = normalize(w) # traditional weight normalization
+        w = w * (gain / np.sqrt(w[0].numel())) # magnitude-preserving scaling
+        w = w.to(x.dtype)
+        if w.ndim == 2:
+            return x @ w.t()
+        assert w.ndim == 4
+        return torch.nn.functional.conv2d(x, w, padding=(w.shape[-1]//2,))
 
-        weight = normalize_weight(self.weight, eps=self.eps) / sqrt(self.fan_in)
+#----------------------------------------------------------------------------
+# U-Net encoder/decoder block with optional self-attention (Figure 21).
 
-        if self.concat_ones_to_input:
-            x = F.pad(x, (0, 0, 0, 0, 1, 0), value=1.0)
-
-        return F.conv2d(x, weight, padding="same")
-
-
-class Linear(Module):
-    def __init__(self, dim_in, dim_out, eps=1e-4):
-        super().__init__()
-        weight = torch.randn(dim_out, dim_in)
-        self.weight = nn.Parameter(weight)
-        self.eps = eps
-        self.fan_in = dim_in
-
-    def forward(self, x):
-        if self.training:
-            with torch.no_grad():
-                normed_weight = normalize_weight(self.weight, eps=self.eps)
-                self.weight.copy_(normed_weight)
-
-        weight = normalize_weight(self.weight, eps=self.eps) / sqrt(self.fan_in)
-        return F.linear(x, weight)
-
-
-# mp fourier embeds
-
-
-class MPFourierEmbedding(Module):
-    def __init__(self, dim):
-        super().__init__()
-        assert divisible_by(dim, 2)
-        half_dim = dim // 2
-        self.weights = nn.Parameter(torch.randn(half_dim), requires_grad=False)
-
-    def forward(self, x):
-        x = rearrange(x, "b -> b 1")
-        freqs = x * rearrange(self.weights, "d -> 1 d") * 2 * math.pi
-        return torch.cat((freqs.sin(), freqs.cos()), dim=-1) * sqrt(2)
-
-
-# building block modules
-
-
-class Encoder(Module):
-    def __init__(
-        self,
-        dim,
-        dim_out=None,
-        *,
-        emb_dim=None,
-        dropout=0.1,
-        mp_add_t=0.3,
-        has_attn=False,
-        attn_dim_head=64,
-        attn_res_mp_add_t=0.3,
-        downsample=False
+class Block(torch.nn.Module):
+    def __init__(self,
+        in_channels,                    # Number of input channels.
+        out_channels,                   # Number of output channels.
+        emb_channels,                   # Number of embedding channels.
+        flavor              = 'enc',    # Flavor: 'enc' or 'dec'.
+        resample_mode       = 'keep',   # Resampling: 'keep', 'up', or 'down'.
+        resample_filter     = [1,1],    # Resampling filter.
+        attention           = False,    # Include self-attention?
+        channels_per_head   = 64,       # Number of channels per attention head.
+        dropout             = 0,        # Dropout probability.
+        res_balance         = 0.3,      # Balance between main branch (0) and residual branch (1).
+        attn_balance        = 0.3,      # Balance between main branch (0) and self-attention (1).
+        clip_act            = 256,      # Clip output activations. None = do not clip.
     ):
         super().__init__()
-        dim_out = default(dim_out, dim)
+        self.out_channels = out_channels
+        self.flavor = flavor
+        self.resample_filter = resample_filter
+        self.resample_mode = resample_mode
+        self.num_heads = out_channels // channels_per_head if attention else 0
+        self.dropout = dropout
+        self.res_balance = res_balance
+        self.attn_balance = attn_balance
+        self.clip_act = clip_act
+        self.emb_gain = torch.nn.Parameter(torch.zeros([]))
+        self.conv_res0 = MPConv(out_channels if flavor == 'enc' else in_channels, out_channels, kernel=[3,3])
+        self.emb_linear = MPConv(emb_channels, out_channels, kernel=[])
+        self.conv_res1 = MPConv(out_channels, out_channels, kernel=[3,3])
+        self.conv_skip = MPConv(in_channels, out_channels, kernel=[1,1]) if in_channels != out_channels else None
+        self.attn_qkv = MPConv(out_channels, out_channels * 3, kernel=[1,1]) if self.num_heads != 0 else None
+        self.attn_proj = MPConv(out_channels, out_channels, kernel=[1,1]) if self.num_heads != 0 else None
 
-        self.downsample = downsample
-        self.downsample_conv = None
+    def forward(self, x, emb):
+        # Main branch.
+        x = resample(x, f=self.resample_filter, mode=self.resample_mode)
+        if self.flavor == 'enc':
+            if self.conv_skip is not None:
+                x = self.conv_skip(x)
+            x = normalize(x, dim=1) # pixel norm
 
-        curr_dim = dim
-        if downsample:
-            self.downsample_conv = Conv2d(curr_dim, dim_out, 1)
-            curr_dim = dim_out
+        # Residual branch.
+        y = self.conv_res0(mp_silu(x))
+        c = self.emb_linear(emb, gain=self.emb_gain) + 1
+        y = mp_silu(y * c.unsqueeze(2).unsqueeze(3).to(y.dtype))
+        if self.training and self.dropout != 0:
+            y = torch.nn.functional.dropout(y, p=self.dropout)
+        y = self.conv_res1(y)
 
-        self.pixel_norm = PixelNorm(dim=1)
+        # Connect the branches.
+        if self.flavor == 'dec' and self.conv_skip is not None:
+            x = self.conv_skip(x)
+        x = mp_sum(x, y, t=self.res_balance)
 
-        self.to_emb = None
-        if exists(emb_dim):
-            self.to_emb = nn.Sequential(Linear(emb_dim, dim_out), Gain())
+        # Self-attention.
+        # Note: torch.nn.functional.scaled_dot_product_attention() could be used here,
+        # but we haven't done sufficient testing to verify that it produces identical results.
+        if self.num_heads != 0:
+            y = self.attn_qkv(x)
+            y = y.reshape(y.shape[0], self.num_heads, -1, 3, y.shape[2] * y.shape[3])
+            q, k, v = normalize(y, dim=2).unbind(3) # pixel norm & split
+            w = torch.einsum('nhcq,nhck->nhqk', q, k / np.sqrt(q.shape[2])).softmax(dim=3)
+            y = torch.einsum('nhqk,nhck->nhcq', w, v)
+            y = self.attn_proj(y.reshape(*x.shape))
+            x = mp_sum(x, y, t=self.attn_balance)
 
-        self.block1 = nn.Sequential(MPSiLU(), Conv2d(curr_dim, dim_out, 3))
-
-        self.block2 = nn.Sequential(
-            MPSiLU(), nn.Dropout(dropout), Conv2d(dim_out, dim_out, 3)
-        )
-
-        self.res_mp_add = MPAdd(t=mp_add_t)
-
-        self.attn = None
-        if has_attn:
-            self.attn = Attention(
-                dim=dim_out,
-                heads=max(ceil(dim_out / attn_dim_head), 2),
-                dim_head=attn_dim_head,
-                mp_add_t=attn_res_mp_add_t,
-            )
-
-    def forward(self, x, emb=None):
-        if self.downsample:
-            h, w = x.shape[-2:]
-            x = F.interpolate(x, (h // 2, w // 2), mode="bilinear")
-            x = self.downsample_conv(x)
-
-        x = self.pixel_norm(x)
-
-        res = x.clone()
-
-        x = self.block1(x)
-
-        if exists(emb):
-            scale = self.to_emb(emb) + 1
-            x = x * rearrange(scale, "b c -> b c 1 1")
-
-        x = self.block2(x)
-
-        x = self.res_mp_add(x, res)
-
-        if exists(self.attn):
-            x = self.attn(x)
-
+        # Clip activations.
+        if self.clip_act is not None:
+            x = x.clip_(-self.clip_act, self.clip_act)
         return x
 
+#----------------------------------------------------------------------------
+# EDM2 U-Net model (Figure 21).
 
-class Decoder(Module):
-    def __init__(
-        self,
-        dim,
-        dim_out=None,
-        *,
-        emb_dim=None,
-        dropout=0.1,
-        mp_add_t=0.3,
-        has_attn=False,
-        attn_dim_head=64,
-        attn_res_mp_add_t=0.3,
-        upsample=False
-    ):
+class LabelEmbedder(nn.Module):
+    def __init__(self, num_classes, dim, dropout_prob):
         super().__init__()
-        dim_out = default(dim_out, dim)
-
-        self.upsample = upsample
-        self.needs_skip = not upsample
-
-        self.to_emb = None
-        if exists(emb_dim):
-            self.to_emb = nn.Sequential(Linear(emb_dim, dim_out), Gain())
-
-        self.block1 = nn.Sequential(MPSiLU(), Conv2d(dim, dim_out, 3))
-
-        self.block2 = nn.Sequential(
-            MPSiLU(), nn.Dropout(dropout), Conv2d(dim_out, dim_out, 3)
-        )
-
-        self.res_conv = Conv2d(dim, dim_out, 1) if dim != dim_out else nn.Identity()
-
-        self.res_mp_add = MPAdd(t=mp_add_t)
-
-        self.attn = None
-        if has_attn:
-            self.attn = Attention(
-                dim=dim_out,
-                heads=max(ceil(dim_out / attn_dim_head), 2),
-                dim_head=attn_dim_head,
-                mp_add_t=attn_res_mp_add_t,
-            )
-
-    def forward(self, x, emb=None):
-        if self.upsample:
-            h, w = x.shape[-2:]
-            x = F.interpolate(x, (h * 2, w * 2), mode="bilinear")
-
-        res = self.res_conv(x)
-
-        x = self.block1(x)
-
-        if exists(emb):
-            scale = self.to_emb(emb) + 1
-            x = x * rearrange(scale, "b c -> b c 1 1")
-
-        x = self.block2(x)
-
-        x = self.res_mp_add(x, res)
-
-        if exists(self.attn):
-            x = self.attn(x)
-
-        return x
-
-
-# attention
-
-
-class Attention(Module):
-    def __init__(self, dim, heads=4, dim_head=64, num_mem_kv=4, mp_add_t=0.3):
-        super().__init__()
-        self.heads = heads
-        hidden_dim = dim_head * heads
-
-        self.pixel_norm = PixelNorm(dim=-1)
-
-        self.mem_kv = nn.Parameter(torch.randn(2, heads, num_mem_kv, dim_head))
-        self.to_qkv = Conv2d(dim, hidden_dim * 3, 1)
-        self.to_out = Conv2d(hidden_dim, dim, 1)
-
-        self.mp_add = MPAdd(t=mp_add_t)
-
-    def forward(self, x):
-        res, b, c, h, w = x, *x.shape
-
-        qkv = self.to_qkv(x).chunk(3, dim=1)
-        q, k, v = map(
-            lambda t: rearrange(t, "b (h c) x y -> b h (x y) c", h=self.heads), qkv
-        )
-
-        mk, mv = map(lambda t: repeat(t, "h n d -> b h n d", b=b), self.mem_kv)
-        k, v = map(partial(torch.cat, dim=-2), ((mk, k), (mv, v)))
-
-        q, k, v = map(self.pixel_norm, (q, k, v))
-
-        out = F.scaled_dot_product_attention(q, k, v)
-
-        out = rearrange(out, "b h (x y) d -> b (h d) x y", x=h, y=w)
-        out = self.to_out(out)
-
-        return self.mp_add(out, res)
-
-
-# unet proposed by karras
-# bias-less, no group-norms, with magnitude preserving operations
-
-
-class KarrasUnet(Module):
-    """
-    going by figure 21. config G
-    """
-
-    def __init__(
-        self,
-        *,
-        dim=192,
-        dim_max=768,  # channels will cap out to this value
-        num_classes=None,  # in paper, they do 1000 classes for a popular benchmark
-        channels=4,  # 4 channels in paper for some reason, must be alpha channel?
-        # num_downsamples = 3,
-        dim_mults=[1, 2, 3, 4],
-        num_blocks_per_stage=4,
-        attn_levels=[1, 2],
-        fourier_dim=16,
-        attn_dim_head=64,
-        mp_cat_t=0.5,
-        mp_add_emb_t=0.5,
-        attn_res_mp_add_t=0.3,
-        resnet_mp_add_t=0.3,
-        dropout=0.1,
-    ):
-        super().__init__()
-
-        # determine dimensions
-
-        self.channels = channels
-        input_channels = channels
-
-        # input and output blocks
-
-        self.input_block = Conv2d(input_channels, dim, 3, concat_ones_to_input=True)
-
-        self.output_block = nn.Sequential(Conv2d(dim, channels, 3), Gain())
-
-        # time embedding
-
-        emb_dim = dim * 4
-
-        self.to_time_emb = nn.Sequential(
-            MPFourierEmbedding(fourier_dim), Linear(fourier_dim, emb_dim)
-        )
-
-        # class embedding
-
-        self.needs_class_labels = exists(num_classes)
+        use_cfg_embedding = dropout_prob > 0
+        self.embedding = nn.Embedding(num_classes + use_cfg_embedding, dim)
         self.num_classes = num_classes
+        self.dropout_prob = dropout_prob
 
-        if self.needs_class_labels:
-            self.to_class_emb = Linear(num_classes, 4 * dim)
-            self.add_class_emb = MPAdd(t=mp_add_emb_t)
-
-        # final embedding activations
-
-        self.emb_activation = MPSiLU()
-
-        # number of downsamples
-
-        self.num_downsamples = len(dim_mults) - 1
-
-        # attention
-
-        attn_levels = set(attn_levels)
-
-        # resnet block
-
-        block_kwargs = dict(
-            dropout=dropout,
-            emb_dim=emb_dim,
-            attn_dim_head=attn_dim_head,
-            attn_res_mp_add_t=attn_res_mp_add_t,
-        )
-
-        # unet encoder and decoders
-
-        self.downs = ModuleList([])
-        self.ups = ModuleList([])
-
-        curr_dim = dim
-        curr_level = 0
-
-        self.skip_mp_cat = MPCat(t=mp_cat_t, dim=1)
-
-        # take care of skip connection for initial input block and first three encoder blocks
-
-        prepend(self.ups, Decoder(dim * 2, dim, **block_kwargs))
-
-        assert num_blocks_per_stage >= 1
-
-        for _ in range(num_blocks_per_stage):
-            enc = Encoder(curr_dim, curr_dim, **block_kwargs)
-            dec = Decoder(curr_dim * 2, curr_dim, **block_kwargs)
-
-            append(self.downs, enc)
-            prepend(self.ups, dec)
-
-        # stages
-
-        dim_outs = [dim * mult for mult in dim_mults]
-        for i in range(self.num_downsamples):
-            dim_out = min(dim_max, dim_outs[i + 1])
-            upsample = Decoder(
-                dim_out,
-                curr_dim,
-                has_attn=curr_level in attn_levels,
-                upsample=True,
-                **block_kwargs
+    def token_drop(self, labels, force_drop_ids=None):
+        if force_drop_ids is None:
+            drop_ids = (
+                torch.rand(labels.shape[0], device=labels.device) < self.dropout_prob
             )
-
-            curr_level += 1
-            has_attn = curr_level in attn_levels
-
-            downsample = Encoder(
-                curr_dim, dim_out, downsample=True, has_attn=has_attn, **block_kwargs
-            )
-
-            append(self.downs, downsample)
-            prepend(self.ups, upsample)
-            prepend(
-                self.ups,
-                Decoder(dim_out * 2, dim_out, has_attn=has_attn, **block_kwargs),
-            )
-
-            for _ in range(num_blocks_per_stage):
-                enc = Encoder(dim_out, dim_out, has_attn=has_attn, **block_kwargs)
-                dec = Decoder(dim_out * 2, dim_out, has_attn=has_attn, **block_kwargs)
-
-                append(self.downs, enc)
-                prepend(self.ups, dec)
-
-            curr_dim = dim_out
-
-        # take care of the two middle decoders
-
-        mid_has_attn = curr_level in attn_levels
-
-        self.mids = ModuleList(
-            [
-                Decoder(curr_dim, curr_dim, has_attn=mid_has_attn, **block_kwargs),
-                Decoder(curr_dim, curr_dim, has_attn=mid_has_attn, **block_kwargs),
-            ]
-        )
-
-        self.out_dim = channels
-
-    @property
-    def downsample_factor(self):
-        return 2**self.num_downsamples
-
-    def forward(self, x, time, class_labels=None):
-        # time condition
-
-        time_emb = self.to_time_emb(time)
-
-        # class condition
-
-        assert xnor(exists(class_labels), self.needs_class_labels)
-
-        if self.needs_class_labels:
-            if class_labels.dtype in (torch.int, torch.long):
-                class_labels = F.one_hot(class_labels, self.num_classes)
-
-            assert class_labels.shape[-1] == self.num_classes
-            class_labels = class_labels.float() * sqrt(self.num_classes)
-
-            class_emb = self.to_class_emb(class_labels)
-
-            time_emb = self.add_class_emb(time_emb, class_emb)
-
-        # final mp-silu for embedding
-
-        emb = self.emb_activation(time_emb)
-
-        # skip connections
-
-        skips = []
-
-        # input block
-
-        x = self.input_block(x)
-
-        skips.append(x)
-
-        # down
-
-        for encoder in self.downs:
-            x = encoder(x, emb=emb)
-            skips.append(x)
-
-        # mid
-
-        for decoder in self.mids:
-            x = decoder(x, emb=emb)
-
-        # up
-
-        for decoder in self.ups:
-            if decoder.needs_skip:
-                skip = skips.pop()
-                x = self.skip_mp_cat(x, skip)
-
-            x = decoder(x, emb=emb)
-
-        # output block
-
-        return self.output_block(x)
-    
-    def forward_with_cfg(self, x, time, class_labels=None, cfg_scale=1.0):
-        x = x.repeat(2, 1, 1, 1)
-        time = time.repeat(2)
-        
-        # time condition
-
-        time_emb = self.to_time_emb(time)
-
-        # class condition
-
-        assert xnor(exists(class_labels), self.needs_class_labels)
-
-        if self.needs_class_labels:
-            if class_labels.dtype in (torch.int, torch.long):
-                class_labels = F.one_hot(class_labels, self.num_classes)
-
-            assert class_labels.shape[-1] == self.num_classes
-            class_labels = class_labels.float() * sqrt(self.num_classes)
-            
-            class_labels = class_labels.repeat(2, 1)
-            class_labels[len(x) // 2 :] *= 0
-
-            class_emb = self.to_class_emb(class_labels)
-
-            time_emb = self.add_class_emb(time_emb, class_emb)
-
-        # final mp-silu for embedding
-
-        emb = self.emb_activation(time_emb)
-
-        # skip connections
-
-        skips = []
-
-        # input block
-
-        x = self.input_block(x)
-
-        skips.append(x)
-
-        # down
-
-        for encoder in self.downs:
-            x = encoder(x, emb=emb)
-            skips.append(x)
-
-        # mid
-
-        for decoder in self.mids:
-            x = decoder(x, emb=emb)
-
-        # up
-
-        for decoder in self.ups:
-            if decoder.needs_skip:
-                skip = skips.pop()
-                x = self.skip_mp_cat(x, skip)
-
-            x = decoder(x, emb=emb)
-
-        # output block
-
-        x = self.output_block(x)
-        
-        cond_eps, uncond_eps = x.split(len(x) // 2)
-        return uncond_eps + (cond_eps - uncond_eps) * cfg_scale
-
-
-# improvised MP Transformer
-
-
-class MPFeedForward(Module):
-    def __init__(self, *, dim, mult=4, mp_add_t=0.3):
-        super().__init__()
-        dim_inner = int(dim * mult)
-        self.net = nn.Sequential(
-            PixelNorm(dim=1),
-            Conv2d(dim, dim_inner, 1),
-            MPSiLU(),
-            Conv2d(dim_inner, dim, 1),
-        )
-
-        self.mp_add = MPAdd(t=mp_add_t)
-
-    def forward(self, x):
-        res = x
-        out = self.net(x)
-        return self.mp_add(out, res)
-
-
-class MPImageTransformer(Module):
-    def __init__(
-        self,
-        *,
-        dim,
-        depth,
-        dim_head=64,
-        heads=8,
-        num_mem_kv=4,
-        ff_mult=4,
-        residual_mp_add_t=0.3
+        else:
+            drop_ids = force_drop_ids == 1
+        labels = torch.where(drop_ids, self.num_classes, labels)
+        return labels
+
+    def forward(self, labels, train, force_drop_ids=None):
+        use_dropout = self.dropout_prob > 0
+        if (train and use_dropout) or (force_drop_ids is not None):
+            labels = self.token_drop(labels, force_drop_ids)
+        embeddings = self.embedding(labels)
+        return embeddings
+
+class UNet(torch.nn.Module):
+    def __init__(self,
+        img_resolution,                     # Image resolution.
+        img_channels,                       # Image channels.
+        num_classes,                        # Class label dimensionality. 0 = unconditional.
+        model_channels      = 192,          # Base multiplier for the number of channels.
+        channel_mult        = [1,2,3,4],    # Per-resolution multipliers for the number of channels.
+        channel_mult_noise  = None,         # Multiplier for noise embedding dimensionality. None = select based on channel_mult.
+        channel_mult_emb    = None,         # Multiplier for final embedding dimensionality. None = select based on channel_mult.
+        num_blocks          = 3,            # Number of residual blocks per resolution.
+        attn_resolutions    = [16,8],       # List of resolutions with self-attention.
+        label_balance       = 0.5,          # Balance between noise embedding (0) and class embedding (1).
+        concat_balance      = 0.5,          # Balance between skip connections (0) and main path (1).
+        **block_kwargs,                     # Arguments for Block.
     ):
         super().__init__()
-        self.layers = ModuleList([])
+        cblock = [model_channels * x for x in channel_mult]
+        cnoise = model_channels * channel_mult_noise if channel_mult_noise is not None else cblock[0]
+        cemb = model_channels * channel_mult_emb if channel_mult_emb is not None else max(cblock)
+        self.label_balance = label_balance
+        self.concat_balance = concat_balance
+        self.out_gain = torch.nn.Parameter(torch.zeros([]))
 
-        for _ in range(depth):
-            self.layers.append(
-                ModuleList(
-                    [
-                        Attention(
-                            dim=dim,
-                            heads=heads,
-                            dim_head=dim_head,
-                            num_mem_kv=num_mem_kv,
-                            mp_add_t=residual_mp_add_t,
-                        ),
-                        MPFeedForward(
-                            dim=dim, mult=ff_mult, mp_add_t=residual_mp_add_t
-                        ),
-                    ]
-                )
-            )
+        # Embedding.
+        label_dim = cemb
+        self.num_classes = num_classes
+        self.label_embedder = LabelEmbedder(num_classes, label_dim, dropout_prob=0.1) if num_classes > 0 else None
+        self.emb_fourier = MPFourier(cnoise)
+        self.emb_noise = MPConv(cnoise, cemb, kernel=[])
+        self.emb_label = MPConv(label_dim, cemb, kernel=[]) if label_dim != 0 else None
 
-    def forward(self, x):
+        # Encoder.
+        self.enc = torch.nn.ModuleDict()
+        cout = img_channels + 1
+        for level, channels in enumerate(cblock):
+            res = img_resolution >> level
+            if level == 0:
+                cin = cout
+                cout = channels
+                self.enc[f'{res}x{res}_conv'] = MPConv(cin, cout, kernel=[3,3])
+            else:
+                self.enc[f'{res}x{res}_down'] = Block(cout, cout, cemb, flavor='enc', resample_mode='down', **block_kwargs)
+            for idx in range(num_blocks):
+                cin = cout
+                cout = channels
+                self.enc[f'{res}x{res}_block{idx}'] = Block(cin, cout, cemb, flavor='enc', attention=(res in attn_resolutions), **block_kwargs)
 
-        for attn, ff in self.layers:
-            x = attn(x)
-            x = ff(x)
+        # Decoder.
+        self.dec = torch.nn.ModuleDict()
+        skips = [block.out_channels for block in self.enc.values()]
+        for level, channels in reversed(list(enumerate(cblock))):
+            res = img_resolution >> level
+            if level == len(cblock) - 1:
+                self.dec[f'{res}x{res}_in0'] = Block(cout, cout, cemb, flavor='dec', attention=True, **block_kwargs)
+                self.dec[f'{res}x{res}_in1'] = Block(cout, cout, cemb, flavor='dec', **block_kwargs)
+            else:
+                self.dec[f'{res}x{res}_up'] = Block(cout, cout, cemb, flavor='dec', resample_mode='up', **block_kwargs)
+            for idx in range(num_blocks + 1):
+                cin = cout + skips.pop()
+                cout = channels
+                self.dec[f'{res}x{res}_block{idx}'] = Block(cin, cout, cemb, flavor='dec', attention=(res in attn_resolutions), **block_kwargs)
+        self.out_conv = MPConv(cout, img_channels, kernel=[3,3])
 
+    def forward(self, x, noise_labels, class_labels=None):
+        # Embedding.
+        emb = self.emb_noise(self.emb_fourier(noise_labels))
+        if self.label_embedder is not None:
+            emb = mp_sum(emb, self.label_embedder(class_labels, self.training) * np.sqrt(self.num_classes), t=self.label_balance)
+        emb = mp_silu(emb)
+
+        # Encoder.
+        x = torch.cat([x, torch.ones_like(x[:, :1])], dim=1)
+        skips = []
+        for name, block in self.enc.items():
+            x = block(x) if 'conv' in name else block(x, emb)
+            skips.append(x)
+
+        # Decoder.
+        for name, block in self.dec.items():
+            if 'block' in name:
+                x = mp_cat(x, skips.pop(), t=self.concat_balance)
+            x = block(x, emb)
+        x = self.out_conv(x, gain=self.out_gain)
         return x
-
-
-# works best with inverse square root decay schedule
-
-
-def InvSqrtDecayLRSched(optimizer, t_ref=70000, sigma_ref=0.01):
-    """
-    refer to equation 67 and Table1
-    """
-
-    def inv_sqrt_decay_fn(t: int):
-        return sigma_ref / sqrt(max(t / t_ref, 1.0))
-
-    return LambdaLR(optimizer, lr_lambda=inv_sqrt_decay_fn)
-
-
-# example
-
-if __name__ == "__main__":
-    unet = KarrasUnet(
-        image_size=64,
-        dim=192,
-        dim_max=768,
-        num_classes=1000,
-    )
-
-    images = torch.randn(2, 4, 64, 64)
-
-    denoised_images = unet(
-        images,
-        time=torch.ones(
-            2,
-        ),
-        class_labels=torch.randint(0, 1000, (2,)),
-    )
-
-    assert denoised_images.shape == images.shape
+    
+    def forward_with_cfg(self, x, noise_labels, class_labels, cfg_scale):
+        x = x.repeat(2, 1, 1, 1)
+        t = noise_labels.repeat(2)
+        y = class_labels.repeat(2)
+        y[len(x) // 2:] = self.label_embedder.num_classes
+        
+        model_out = self.forward(x, t, y)
+        cond_eps, uncond_eps = model_out.split(len(x) // 2)
+        out = uncond_eps + (cond_eps - uncond_eps) * cfg_scale
+        return out

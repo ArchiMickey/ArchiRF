@@ -25,7 +25,7 @@ class FIDEvaluation:
         self,
         batch_size,
         dl,
-        sampler,
+        model,
         channels=3,
         accelerator=None,
         stats_dir="./results",
@@ -38,7 +38,7 @@ class FIDEvaluation:
         self.device = device
         self.channels = channels
         self.dl = dl
-        self.sampler = sampler
+        self.model = model
         self.stats_dir = stats_dir
         if not Path(stats_dir).exists():
             Path(stats_dir).mkdir(parents=True, exist_ok=True)
@@ -82,7 +82,7 @@ class FIDEvaluation:
                 real_features = self.calculate_inception_features(real_samples)
                 stacked_real_features.append(real_features)
             stacked_real_features = (
-                torch.cat(stacked_real_features, dim=0).float().cpu().numpy()
+                torch.cat(stacked_real_features, dim=0).cpu().numpy()
             )
             m2 = np.mean(stacked_real_features, axis=0)
             s2 = np.cov(stacked_real_features, rowvar=False)

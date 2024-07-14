@@ -36,7 +36,7 @@ optimizer:
 
 lr_scheduler:
   _partial_: true
-  _target_: modules.utils.LinearWarmupLRSched
+  _target_: modules.lr_scheduler.LinearWarmupLRSched
   warmup_steps: 1000
 
 trainer:

@@ -4,7 +4,8 @@ import torch.nn.functional as F
 from einops import rearrange
 from tqdm.auto import tqdm
 
-from diffusers.models import AutoencoderKL
+# from diffusers.models import AutoencoderKL
+from autoencoder.model import AutoencoderKL, Autoencoder
 
 from modules.utils import normalize_to_neg1_1, unnormalize_to_0_1
 
@@ -62,8 +63,9 @@ class RectifiedFlow(nn.Module):
             z = unnormalize_to_0_1(z.clip(-1, 1))
 
         if return_all_steps:
+            all_steps = torch.stack(images)
             if self.normalize_input_output:
-                all_steps = unnormalize_to_0_1(torch.stack(images).clip(-1, 1))
+                all_steps = unnormalize_to_0_1(all_steps.clip(-1, 1))
             return z, all_steps
         return z
 
@@ -86,10 +88,14 @@ class RectifiedFlow(nn.Module):
             z = z - v_t / sampling_steps
             images.append(z)
 
-        z = unnormalize_to_0_1(z.clip(-1, 1))
+        if self.normalize_input_output:
+            z = unnormalize_to_0_1(z.clip(-1, 1))
 
         if return_all_steps:
-            return z, unnormalize_to_0_1(torch.stack(images).clip(-1, 1))
+            all_steps = torch.stack(images)
+            if self.normalize_input_output:
+                all_steps = unnormalize_to_0_1(all_steps.clip(-1, 1))
+            return z, all_steps
         return z
 
     def fid_sample(self, batch_size, device, cfg_scale=5.0):
@@ -110,17 +116,20 @@ class LatentRectifiedFlow(RectifiedFlow):
         logit_normal_sampling_t=False,
     ):
         super().__init__(net, channels, image_size, logit_normal_sampling_t)
-        self.vae = AutoencoderKL.from_pretrained("stabilityai/sdxl-vae")
+        self.vae = Autoencoder.from_pretrained("/home/archimickey/Projects/BlueHydrangea/autoencoder/autoencoder_ema.ckpt")
         for p in self.vae.parameters():
             p.requires_grad = False
         
     @torch.inference_mode()
     def encode(self, x):
-        return self.vae.encode(x).latent_dist.sample().mul_(0.13025)
+        x = normalize_to_neg1_1(x)
+        return self.vae.encode(x)
     
     @torch.inference_mode()
-    def decode(self, x):
-        return self.vae.decode(x / 0.13025).sample
+    def decode(self, z):
+        z = z.clip(-1, 1)
+        x_ = self.vae.decode(z)
+        return unnormalize_to_0_1(x_.clip(-1, 1))
     
     def forward(self, x, c=None):
         if self.use_cond:
@@ -132,8 +141,7 @@ class LatentRectifiedFlow(RectifiedFlow):
             t = torch.rand((x.shape[0],), device=x.device)
 
         t_ = rearrange(t, "b -> b 1 1 1")
-        # x = normalize_to_neg1_1(x)
-        # x = self.encode(x)
+        x = self.encode(x)
         z = torch.randn_like(x)
         z_t = (1 - t_) * x + t_ * z
         v_t = self.net(z_t, t, c)
@@ -155,11 +163,10 @@ class LatentRectifiedFlow(RectifiedFlow):
             images.append(z)
 
         z = self.decode(z)
-        z = unnormalize_to_0_1(z.clip(-1, 1))
 
         if return_all_steps:
             all_steps = [self.decode(img) for img in images]
-            all_steps = unnormalize_to_0_1(torch.stack(all_steps).clip(-1, 1))
+            all_steps = torch.stack(all_steps)
             return z, all_steps
         return z
 
@@ -183,10 +190,9 @@ class LatentRectifiedFlow(RectifiedFlow):
             images.append(z)
 
         z = self.decode(z)
-        z = unnormalize_to_0_1(z.clip(-1, 1))
 
         if return_all_steps:
             all_steps = [self.decode(img) for img in images]
-            all_steps = unnormalize_to_0_1(torch.stack(all_steps).clip(-1, 1))
+            all_steps = torch.stack(all_steps)
             return z, all_steps
         return z

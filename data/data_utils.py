@@ -16,16 +16,18 @@ def cycle(iterable):
         for x in iterable:
             yield x
 
+
 class RetDictDataset(Dataset):
     def __init__(self, ds):
         self.ds = ds
-    
+
     def __len__(self):
         return len(self.ds)
 
     def __getitem__(self, idx):
         img, label = self.ds[idx]
         return {"img": img, "label": label}
+
 
 class ExperimentDataModule:
     def __init__(
@@ -51,11 +53,23 @@ class ExperimentDataModule:
                 T.ToTensor(),
             ]
         )
+
+        val_transform = T.Compose(
+            [T.Resize(image_size), T.CenterCrop(image_size), T.ToTensor()]
+        )
+
         if ds_class is ImageNet:
-            self.ds = ds_class(root, transform=transform)
+            self.train_ds = ds_class(root, transform=transform)
+            self.val_ds = ds_class(root, split="val", transform=val_transform)
         else:
-            self.ds = ds_class(root, train=True, download=True, transform=transform)
-        self.ds = RetDictDataset(self.ds)
+            self.train_ds = ds_class(
+                root, train=True, download=True, transform=transform
+            )
+            self.val_ds = ds_class(
+                root, train=False, download=True, transform=val_transform
+            )
+        self.train_ds = RetDictDataset(self.train_ds)
+        self.val_ds = RetDictDataset(self.val_ds)
 
     def get_dataset(self):
         assert (
@@ -68,9 +82,9 @@ class ExperimentDataModule:
         elif self.dataset_name == "imagenet":
             return ImageNet
 
-    def get_dataloader(self):
+    def get_train_dataloader(self):
         dl = DataLoader(
-            self.ds,
+            self.train_ds,
             batch_size=self.batch_size,
             num_workers=self.num_workers,
             shuffle=True,
@@ -79,6 +93,15 @@ class ExperimentDataModule:
         dl = cycle(dl)
         return dl
 
+    def get_val_dataloader(self):
+        dl = DataLoader(
+            self.val_ds,
+            batch_size=self.batch_size,
+            num_workers=self.num_workers,
+            pin_memory=True,
+        )
+        dl = cycle(dl)
+        return dl
 class LatentImageNetDataset(Dataset):
     def __init__(self, root):
         self.imagenet_ds = ImageNet(root, split="train")
@@ -86,12 +109,8 @@ class LatentImageNetDataset(Dataset):
         latent_paths = [Path(img[0].replace("train", "latent_train")) for img in imgs]
         latent_paths = [str(p.parent / (p.stem + ".pth")) for p in latent_paths]
         self.ds = [(img[0], l_path, img[1]) for img, l_path in zip(imgs, latent_paths)]
-        self.transform = T.Compose([
-            T.Resize(256),
-            T.CenterCrop(256),
-            T.ToTensor()
-        ])
-    
+        self.transform = T.Compose([T.Resize(256), T.CenterCrop(256), T.ToTensor()])
+
     def __len__(self):
         return len(self.ds)
 
@@ -104,7 +123,8 @@ class LatentImageNetDataset(Dataset):
         #     img = img[:3]
         latent = torch.load(latent_path)
         return {"img": latent, "label": label}
-    
+
+
 class LatentImageFolderDataset(Dataset):
     def __init__(self, root):
         self.image_ds = ImageFolder(root)
@@ -112,12 +132,8 @@ class LatentImageFolderDataset(Dataset):
         latent_paths = [Path(img[0].replace("train", "latent_train")) for img in imgs]
         latent_paths = [str(p.parent / (p.stem + ".pth")) for p in latent_paths]
         self.ds = [(img[0], l_path, img[1]) for img, l_path in zip(imgs, latent_paths)]
-        self.transform = T.Compose([
-            T.Resize(256),
-            T.CenterCrop(256),
-            T.ToTensor()
-        ])
-    
+        self.transform = T.Compose([T.Resize(256), T.CenterCrop(256), T.ToTensor()])
+
     def __len__(self):
         return len(self.ds)
 
@@ -130,6 +146,7 @@ class LatentImageFolderDataset(Dataset):
         #     img = img[:3]
         latent = torch.load(latent_path)
         return {"img": latent, "label": label}
+
 
 class LatentImageDataModule:
     def __init__(self, root, dataset_name, batch_size=1, num_workers=0, **kwargs):

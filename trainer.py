@@ -32,7 +32,7 @@ class Trainer:
         accelerator: Accelerator,
         model,
         optimizer,
-        dl,
+        datamodule,
         lr_scheduler=None,
         # hyperparameters
         batch_size=1,
@@ -46,6 +46,7 @@ class Trainer:
         sampling_steps=100,
         save_interval=1000,
         sample_interval=1000,
+        sample_cfg_scales=[1.0, 1.25, 1.5],
         n_per_class=10,
         fid_eval_interval=10000,
         fid_stats_dir="./results",
@@ -58,6 +59,8 @@ class Trainer:
         self.accelerator = accelerator
         self.device = accelerator.device
         model.device = self.device
+        self.datamodule = datamodule
+        dl = datamodule.get_train_dataloader()
         self.model, self.opt, self.dl = accelerator.prepare(model, optimizer, dl)
         self.lr_scheduler = lr_scheduler
 
@@ -69,18 +72,19 @@ class Trainer:
         self.save_interval = save_interval
         self.sampling_steps = sampling_steps
         self.sample_interval = sample_interval
+        self.sample_cfg_scales = sample_cfg_scales
         self.n_per_class = n_per_class
 
         self.use_ema = use_ema
         if self.use_ema:
             self.model_ema = LitEma(self.model, decay=ema_decay)
-        
+
         self.fid_eval_interval = fid_eval_interval
         self.num_fid_samples = num_fid_samples
         self.fid_cfg_scale = fid_cfg_scale
         self.fid_scorer = FIDEvaluation(
             self.batch_size,
-            self.dl,
+            datamodule.get_val_dataloader(),
             self.model,
             self.model.channels,
             stats_dir=fid_stats_dir,
@@ -112,6 +116,7 @@ class Trainer:
 
     def save_ckpt(self):
         state_dict = {
+            "config": self.config,
             "model": self.accelerator.get_state_dict(self.model),
             "opt": self.opt.state_dict(),
             "step": self.step,
@@ -180,17 +185,22 @@ class Trainer:
                     self.model_ema(self.model)
 
                 self.step += 1
-                
+
                 lr = self.opt.param_groups[0]["lr"]
-                self.accelerator.log({"loss": total_loss, "step": self.step, "lr": lr}, self.step)
+                self.accelerator.log(
+                    {"loss": total_loss, "step": self.step, "lr": lr}, self.step
+                )
                 pbar.set_postfix({"loss": total_loss, "lr": lr})
-                
+
+                if self.step % 100 == 0:
+                    self.log_gradients()
+
                 if self.lr_scheduler is not None:
                     self.lr_scheduler.step()
 
                 if self.step % self.save_interval == 0:
                     self.save_ckpt()
-                
+
                 if self.step % self.sample_interval == 0:
                     self.model.eval()
                     with self.accelerator.autocast():
@@ -203,18 +213,27 @@ class Trainer:
                         with self.ema_scope():
                             fid_score = self.fid_scorer.fid_score(self.fid_cfg_scale)
                     self.model.train()
-                    
+
                     logger.info(f"FID score at step {self.step}: {fid_score}")
                     self.accelerator.log({"FID": fid_score}, self.step)
 
         self.accelerator.end_training()
+
+    def log_gradients(self):
+        grad = {
+            f"grad/{name}": param.grad.norm().item()
+            for name, param in self.model.named_parameters()
+            if param.grad is not None
+        }
+
+        self.accelerator.log(grad, self.step)
 
     def log_samples(self):
         with self.ema_scope():
             if self.model.use_cond:
                 logging_images = []
                 logging_animations = []
-                for cfg_scale in [1.0, 1.25, 1.5]:
+                for cfg_scale in self.sample_cfg_scales:
                     num_classes = self.model.net.num_classes
                     if num_classes <= 10:
                         nrow = num_classes
@@ -236,7 +255,7 @@ class Trainer:
                             cfg_scale=cfg_scale,
                             return_all_steps=True,
                         )
-                        
+
                         samples.append(_samples)
                         samples_each_step.append(_samples_each_step)
 
@@ -250,15 +269,15 @@ class Trainer:
                         f"Saved samples at {self.log_dir}/samples_{self.step}_cfg{cfg_scale}.png"
                     )
 
-                    samples_each_step = torch.cat(samples_each_step)
+                    samples_each_step = torch.cat(samples_each_step, dim=1)
                     frames = [
-                        make_grid(s.float(), nrow=nrow).permute(1, 2, 0).cpu().numpy() * 255
+                        make_grid(s.float(), nrow=nrow).permute(1, 2, 0).cpu().numpy()
+                        * 255
                         for s in samples_each_step
                     ]
-                    clip = mpy.ImageSequenceClip(frames, fps=10)
+                    clip = mpy.ImageSequenceClip(frames, fps=len(frames) // 5)
                     clip.write_gif(
                         f"{self.log_dir}/samples_{self.step}_cfg{cfg_scale}.gif",
-                        fps=len(frames) // 5,
                     )
 
                     if self.accelerator.get_tracker("wandb") is not None:

@@ -1,37 +1,36 @@
 hparams:
   seed: 42
-  batch_size: 128
+  batch_size: 256
   grad_accumulate_every: 1
   lr: 1e-4
-  # max_grad_norm: torch.inf
+  # max_grad_norm: 1.
   n_steps: 400000
+  # n_steps: 1
   use_ema: true
   ema_decay: 0.9999
 
 datamodule:
   _partial_: true
   _target_: data.data_utils.ExperimentDataModule
-  dataset_name: cifar10
-  random_horizonal_flip: true
-  root: /mnt/g
-  image_size: 32
-  num_workers: 8
+  dataset_name: imagenet
+  root: /mnt/g/ImageNet
+  image_size: 64
+  num_workers: 20
 
 model:
-  _target_: models.rf.RectifiedFlow
-  channels: 3
-  image_size: ${datamodule.image_size}
+  _target_: models.rf.LatentRectifiedFlow
+  channels: 16
+  image_size: 8
   logit_normal_sampling_t: true
   net:
-    _target_: modules.networks_dit.DiT
-    input_size: 32
-    patch_size: 2
-    in_channels: 3
-    dim: 256
-    depth: 8
-    num_heads: 4
-    num_register_tokens: 8
-    num_classes: 10
+    _target_: modules.networks_mmdit.MMDiT
+    input_size: ${model.image_size}
+  
+    in_channels: ${model.channels}
+    dim: 768
+    depth: 12
+    num_heads: 12
+    num_classes: 1000
 
 optimizer:
   _partial_: true
@@ -51,16 +50,16 @@ trainer:
     _target_: accelerate.Accelerator
     mixed_precision: bf16
     log_with: wandb
-  log_dir: ./logs/cifar10/rf/dit
+  log_dir: ./logs/imagenet/lrf
   sampling_steps: 50
-  save_and_sample_interval: 20000
-  n_per_class: 10
+  save_interval: 50000
+  sample_interval: 20000
   fid_eval_interval: 100000
-  fid_stats_dir: ./results/cifar10
+  fid_stats_dir: ./results/imagenet
   fid_cfg_scale: 1.5
   num_fid_samples: 50000
   logger_kwargs:
     project_name: RF-Experiments
     init_kwargs:
       wandb:
-        name: cifar10-rf-dit
+        name: imagenet-lrf-mmdit

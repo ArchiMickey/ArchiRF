@@ -1,43 +1,46 @@
 hparams:
   seed: 42
-  batch_size: 128
-  grad_accumulate_every: 2
+  batch_size: 256
+  grad_accumulate_every: 1
   lr: 1e-4
   # max_grad_norm: 1.
-  n_steps: 400000
+  n_steps: 1000000
+  # n_steps: 1
   use_ema: true
   ema_decay: 0.9999
 
 datamodule:
   _partial_: true
-  _target_: data.data_utils.LatentImageDataModule
+  _target_: data.data_utils.ExperimentDataModule
   dataset_name: imagenet
   root: /mnt/g/ImageNet
-  num_workers: 8
+  image_size: 64
+  num_workers: 12
 
 model:
-  _target_: models.rf.RectifiedFlow
-  channels: 4
-  image_size: 32
+  _target_: models.rf.LatentRectifiedFlow
+  channels: 16
+  image_size: 8
   logit_normal_sampling_t: true
-  normalize_input_output: false
   net:
     _target_: modules.networks_mmdit.MMDiT
-    in_channels: 4
-    dim: 512
-    depth: 8
-    num_heads: 8
+    input_size: ${model.image_size}
+    patch_size: 2
+    in_channels: ${model.channels}
+    dim: 384
+    depth: 12
+    num_heads: 6
     num_classes: 1000
 
 optimizer:
   _partial_: true
   _target_: bitsandbytes.optim.AdamW8bit
   lr: ${hparams.lr}
-  # weight_decay: 0.
+  weight_decay: 0.
 
 lr_scheduler:
   _partial_: true
-  _target_: modules.utils.LinearWarmupLRSched
+  _target_: modules.lr_scheduler.LinearWarmupLRSched
   warmup_steps: 1000
 
 trainer:
@@ -50,10 +53,11 @@ trainer:
   log_dir: ./logs/imagenet/lrf
   sampling_steps: 50
   save_interval: 50000
-  sample_interval: 1e9
-  fid_eval_interval: 1e9
+  sample_interval: 20000
+  sample_cfg_scales: [1.0, 2.5, 5.0]
+  fid_eval_interval: 100000
   fid_stats_dir: ./results/imagenet
-  fid_cfg_scale: 1.5
+  fid_cfg_scale: 5.0
   num_fid_samples: 50000
   logger_kwargs:
     project_name: RF-Experiments

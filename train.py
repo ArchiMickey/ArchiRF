@@ -14,7 +14,6 @@ def main(cfg):
     set_seed(cfg.hparams.seed)
 
     dm = instantiate(cfg.datamodule)(**cfg.hparams)
-    dl = dm.get_dataloader()
     model = instantiate(cfg.model)
     rprint(summary(model, verbose=0))
     optimizer = instantiate(cfg.optimizer)(model.net.parameters())
@@ -26,7 +25,7 @@ def main(cfg):
         config = OmegaConf.to_container(cfg, resolve=True),
         model=model,
         optimizer=optimizer,
-        dl=dl,
+        datamodule=dm,
         lr_scheduler=lr_scheduler,
         **cfg.hparams,
     )
