@@ -96,3 +96,8 @@ Samples of generating some classes in ImageNet with MMDiT and Latent RF:
 <p align="center">
   <img width="512" height="512" src="assets/imagenet-mmdit-rf.png">
 </p>
+
+## Train a model
+For autoencoder, please check `autoencoder/train.py` for training a autoencoder model.
+For DDPM/RF, please check `train.py` for training a DDPM/RF model.
+You can refer to the config files in each `config` directory to see the training configurations.
