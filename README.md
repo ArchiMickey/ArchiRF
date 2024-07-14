@@ -4,7 +4,7 @@
   <img width="512" height="512" src="assets/imagenet-mmdit-rf.gif">
 </p>
 
-This is a self-interested project to create a Rectified Flow Model for my own experiments. These experiments can be meaningless, but I hope to learn something from them. Specifically, I want to learn how to implement a denoising diffusion probabilistic model(DDPM) and Rectified Flow which simplifies the process of diffusion and produces better results. Besides, I also implement several techniques introduced in some papers to improve the performance of the model.
+This is a self-interested project to create a Rectified Flow Model for my own experiments. These experiments can be meaningless, but I hope to learn something from them. Specifically, I want to learn how to implement a denoising diffusion probabilistic model(DDPM) and Rectified Flow which simplifies the process of diffusion and produces better results. Besides, I also implement several techniques introduced in some papers to improve the performance of the model. The whole project is trained using a single RTX 4090 GPU.
 
 ## Content
 This is a part mentioning what I have done in this project. I may keep updating this part to record my process.
