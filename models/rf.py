@@ -43,7 +43,7 @@ class RectifiedFlow(nn.Module):
         z_t = (1 - t_) * x + t_ * z
         v_t = self.net(z_t, t, c)
         target = z - x
-        return F.mse_loss(target, v_t)
+        return F.mse_loss(v_t, target)
 
     @torch.inference_mode()
     def sample(self, batch_size, device, sampling_steps=50, return_all_steps=False):

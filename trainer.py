@@ -83,7 +83,7 @@ class Trainer:
         self.num_fid_samples = num_fid_samples
         self.fid_cfg_scale = fid_cfg_scale
         self.fid_scorer = FIDEvaluation(
-            self.batch_size,
+            self.batch_size // 2,
             datamodule.get_val_dataloader(),
             self.model,
             self.model.channels,
@@ -130,10 +130,6 @@ class Trainer:
         torch.save(state_dict, ckpt_path)
         logger.info(f"Saved checkpoint at {ckpt_path}")
         self.ckpt_paths.append(ckpt_path)
-
-        # Remove old checkpoints if more than 3 exist
-        if len(self.ckpt_paths) > 3:
-            os.remove(self.ckpt_paths.pop(0))
 
     def load_ckpt(self, ckpt_path):
         accelerator = self.accelerator
@@ -187,12 +183,12 @@ class Trainer:
                 self.step += 1
 
                 lr = self.opt.param_groups[0]["lr"]
-                self.accelerator.log(
-                    {"loss": total_loss, "step": self.step, "lr": lr}, self.step
-                )
                 pbar.set_postfix({"loss": total_loss, "lr": lr})
-
-                if self.step % 100 == 0:
+                
+                self.accelerator.log(
+                        {"loss": total_loss, "step": self.step, "lr": lr}, self.step
+                    )
+                if self.step % 25 == 0:
                     self.log_gradients()
 
                 if self.lr_scheduler is not None:
@@ -203,14 +199,13 @@ class Trainer:
 
                 if self.step % self.sample_interval == 0:
                     self.model.eval()
-                    with self.accelerator.autocast():
-                        self.log_samples()
+                    self.log_samples()
                     self.model.train()
 
                 if self.step % self.fid_eval_interval == 0:
                     self.model.eval()
-                    with self.accelerator.autocast():
-                        with self.ema_scope():
+                    with self.ema_scope():
+                        with self.accelerator.autocast():
                             fid_score = self.fid_scorer.fid_score(self.fid_cfg_scale)
                     self.model.train()
 
@@ -248,13 +243,14 @@ class Trainer:
                     samples_each_step = []
 
                     for _y in batch_y:
-                        _samples, _samples_each_step = self.model.cond_sample(
-                            _y,
-                            self.device,
-                            sampling_steps=self.sampling_steps,
-                            cfg_scale=cfg_scale,
-                            return_all_steps=True,
-                        )
+                        with self.accelerator.autocast():
+                            _samples, _samples_each_step = self.model.cond_sample(
+                                _y,
+                                self.device,
+                                sampling_steps=self.sampling_steps,
+                                cfg_scale=cfg_scale,
+                                return_all_steps=True,
+                            )
 
                         samples.append(_samples)
                         samples_each_step.append(_samples_each_step)
@@ -303,7 +299,7 @@ class Trainer:
                     )
 
             else:
-                batch_batch_size = num_to_groups(100, self.batch_size)
+                batch_batch_size = num_to_groups(100, self.batch_size // 2)
                 samples = []
                 samples_each_step = []
 
