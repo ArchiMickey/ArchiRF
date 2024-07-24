@@ -8,6 +8,11 @@ from typing import Tuple
 from functools import partial
 from einops import repeat, pack, unpack, rearrange
 
+try:
+    from flash_attn import flash_attn_func
+except ImportError:
+    flash_attn_func = None
+
 
 def modulate(x, scale, shift):
     return x * (1 + scale.unsqueeze(1)) + shift.unsqueeze(1)
@@ -42,16 +47,17 @@ class TimestepEmbedder(nn.Module):
 
 
 class MultiTokenLabelEmbedder(nn.Module):
-    def __init__(self, num_classes, dim, dropout_prob):
+    def __init__(self, num_classes, dim, dropout_prob, num_embeddings=2):
         super().__init__()
         use_cfg_embedding = dropout_prob > 0
-        self.embedding1 = nn.Embedding(num_classes + use_cfg_embedding, dim)
-        self.embedding2 = nn.Embedding(num_classes + use_cfg_embedding, dim)
+        self.embeddings = nn.ModuleList()
+        for _ in range(num_embeddings):
+            self.embeddings.append(
+                nn.Embedding(num_classes + int(use_cfg_embedding), dim)
+            )
         self.num_classes = num_classes
         self.dropout_prob = dropout_prob
-        self.mlp = nn.Sequential(
-            nn.Linear(dim * 2, dim), nn.SiLU(), nn.Linear(dim, dim)
-        )
+        self.mlp = nn.Sequential(nn.Linear(dim, dim), nn.SiLU(), nn.Linear(dim, dim))
 
     def token_drop(self, labels, force_drop_ids=None):
         if force_drop_ids is None:
@@ -67,10 +73,43 @@ class MultiTokenLabelEmbedder(nn.Module):
         use_dropout = self.dropout_prob > 0
         if (train and use_dropout) or (force_drop_ids is not None):
             labels = self.token_drop(labels, force_drop_ids)
-        emb1 = self.embedding1(labels)
-        emb2 = self.embedding2(labels)
-        embeddings, _ = pack([emb1, emb2], "b * d")
-        global_embeddings = self.mlp(torch.cat([emb1, emb2], dim=-1))
+        embeddings = [emb(labels) for emb in self.embeddings]
+        embeddings, _ = pack(embeddings, "b * d")
+        global_embeddings = self.mlp(embeddings.mean(1))
+        return embeddings, global_embeddings
+
+
+class IN1KEmbedder(nn.Module):
+    def __init__(self, dim, embed_path, dropout_prob):
+        super().__init__()
+        self.num_classes = 1000
+        self.dropout_prob = dropout_prob
+
+        self.embed = nn.Parameter(torch.load(embed_path), requires_grad=False)
+
+        self.proj = nn.Linear(1280, dim)
+        self.mlp = nn.Sequential(nn.Linear(1280, dim), nn.SiLU(), nn.Linear(dim, dim))
+
+    def token_drop(self, labels, force_drop_ids=None):
+        if force_drop_ids is None:
+            drop_ids = (
+                torch.rand(labels.shape[0], device=labels.device) < self.dropout_prob
+            )
+        else:
+            drop_ids = force_drop_ids == 1
+        labels = torch.where(drop_ids, self.num_classes, labels)
+        return labels
+
+    def forward(self, labels, train, force_drop_ids=None):
+        use_dropout = self.dropout_prob > 0
+        if (train and use_dropout) or (force_drop_ids is not None):
+            labels = self.token_drop(labels, force_drop_ids)
+        null_idx = torch.where(labels == self.num_classes)
+        labels[null_idx] = 0  # replace null token with 0 to avoid out of index error
+        _embeddings = self.embed[labels]
+        _embeddings[null_idx] = _embeddings[null_idx] * 0
+        embeddings = self.proj(_embeddings)
+        global_embeddings = self.mlp(_embeddings.mean(1))
         return embeddings, global_embeddings
 
 
@@ -81,7 +120,9 @@ class RMSNorm(nn.Module):
         self.g = nn.Parameter(torch.ones(1))
 
     def forward(self, x):
-        return F.normalize(x, dim=-1) * self.scale * self.g
+        dtype = x.dtype
+        x = F.normalize(x, dim=-1) * self.scale * self.g
+        return x.to(dtype)
 
 
 class DoubleAttention(nn.Module):
@@ -134,10 +175,16 @@ class DoubleAttention(nn.Module):
             torch.cat([v1, v2], dim=-2),
         )
 
-        x = F.scaled_dot_product_attention(
-            q, k, v, dropout_p=self.attn_drop.p if self.training else 0
-        )
-        x = rearrange(x, "b h n d -> b n (h d)")
+        if flash_attn_func is not None:
+            q, k, v = map(lambda t: rearrange(t, "b h n d -> b n h d"), (q, k, v))
+            x = flash_attn_func(q, k, v, self.attn_drop.p if self.training else 0)
+            x = rearrange(x, "b n h d -> b n (h d)")
+        else:
+            x = F.scaled_dot_product_attention(
+                q, k, v, dropout_p=self.attn_drop.p if self.training else 0
+            )
+            x = rearrange(x, "b h n d -> b n (h d)")
+
         x, c = x.split([N1, N2], dim=1)
         x = self.proj_1(x)
         c = self.proj_2(c)
@@ -213,9 +260,10 @@ class MMDiT(nn.Module):
         depth=28,
         num_heads=16,
         mlp_ratio=4.0,
-        num_register_tokens=4,
+        num_register_tokens=0,
         class_dropout_prob=0.1,
         num_classes=1000,
+        num_embeddings=2,
         learn_sigma=False,
     ):
         super().__init__()
@@ -230,10 +278,16 @@ class MMDiT(nn.Module):
         self.x_embedder = PatchEmbed(input_size, patch_size, in_channels, dim)
         self.t_embedder = TimestepEmbedder(dim)
 
-        self.y_embedder = MultiTokenLabelEmbedder(num_classes, dim, class_dropout_prob)
+        self.y_embedder = MultiTokenLabelEmbedder(
+            num_classes, dim, class_dropout_prob, num_embeddings
+        )
 
         # register tokens
-        self.register_tokens = nn.Parameter(torch.randn(num_register_tokens, dim))
+        self.register_tokens = (
+            nn.Parameter(torch.randn(num_register_tokens, dim))
+            if num_register_tokens > 0
+            else None
+        )
 
         num_patches = self.x_embedder.num_patches
         # Will use fixed sin-cos embedding:
@@ -270,8 +324,8 @@ class MMDiT(nn.Module):
         nn.init.constant_(self.x_embedder.proj.bias, 0)
 
         # Initialize label embedding table:
-        nn.init.normal_(self.y_embedder.embedding1.weight, std=0.02)
-        nn.init.normal_(self.y_embedder.embedding2.weight, std=0.02)
+        for emb in self.y_embedder.embeddings:
+            nn.init.normal_(emb.weight, std=0.02)
         nn.init.normal_(self.y_embedder.mlp[0].weight, std=0.02)
         nn.init.normal_(self.y_embedder.mlp[2].weight, std=0.02)
 
@@ -324,15 +378,18 @@ class MMDiT(nn.Module):
         t: (N,) tensor of diffusion timesteps
         y: (N,) tensor of class labels
         """
+        use_register_tokens = self.register_tokens is not None
         H, W = x.shape[-2:]
         x = (
             self.x_embedder(x) + self.pos_embed
         )  # (N, T, D), where T = H * W / patch_size ** 2
-        # repeat register token
-        r = repeat(self.register_tokens, "n d -> b n d", b=x.shape[0])
 
-        # pack cls token and register token
-        x, ps = pack([x, r], "b * d ")
+        if use_register_tokens:
+            # repeat register token
+            r = repeat(self.register_tokens, "n d -> b n d", b=x.shape[0])
+
+            # pack cls token and register token
+            x, ps = pack([x, r], "b * d ")
 
         t = self.t_embedder(t)  # (N, D)
         global_c = t
@@ -343,7 +400,8 @@ class MMDiT(nn.Module):
             x, y = block(x, y, global_c)  # (N, T, D)
 
         # unpack cls token and register token
-        x, _ = unpack(x, ps, "b * d")
+        if use_register_tokens:
+            x, _ = unpack(x, ps, "b * d")
 
         x = self.final_layer(x, global_c)  # (N, T, patch_size ** 2 * out_channels)
         x = self.unpatchify(x)  # (N, out_channels, H, W)
@@ -359,6 +417,43 @@ class MMDiT(nn.Module):
         cond_eps, uncond_eps = model_out.split(len(x) // 2)
         out = uncond_eps + (cond_eps - uncond_eps) * cfg_scale
         return out
+
+
+class MMDiTwithPretrainedEmbedding(MMDiT):
+    def __init__(
+        self,
+        embed_path,
+        input_size=32,
+        patch_size=2,
+        in_channels=4,
+        dim=1152,
+        depth=28,
+        num_heads=16,
+        mlp_ratio=4.0,
+        num_register_tokens=0,
+        class_dropout_prob=0.1,
+        num_classes=1000,
+        learn_sigma=False,
+    ):
+        super().__init__(
+            input_size,
+            patch_size,
+            in_channels,
+            dim,
+            depth,
+            num_heads,
+            mlp_ratio,
+            num_register_tokens,
+            class_dropout_prob,
+            num_classes,
+            learn_sigma,
+        )
+        self.y_embedder = IN1KEmbedder(dim, embed_path, class_dropout_prob)
+
+        # Initialize label embedding table:
+        nn.init.normal_(self.y_embedder.proj.weight, std=0.02)
+        nn.init.normal_(self.y_embedder.mlp[0].weight, std=0.02)
+        nn.init.normal_(self.y_embedder.mlp[2].weight, std=0.02)
 
 
 # Positional embedding from:
