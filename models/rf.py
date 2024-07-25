@@ -116,7 +116,7 @@ class LatentRectifiedFlow(RectifiedFlow):
         logit_normal_sampling_t=False,
     ):
         super().__init__(net, channels, image_size, logit_normal_sampling_t)
-        self.vae = Autoencoder.from_pretrained("/home/archimickey/Projects/BlueHydrangea/autoencoder/autoencoder_ema.ckpt")
+        self.vae = Autoencoder.from_pretrained("autoencoder/autoencoder_ema.ckpt")
         for p in self.vae.parameters():
             p.requires_grad = False
         

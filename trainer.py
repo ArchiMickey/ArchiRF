@@ -1,14 +1,12 @@
 import torch
 from torchvision.utils import make_grid, save_image
 from accelerate import Accelerator
-from diffusers.models import AutoencoderKL
 
 from tqdm.auto import tqdm
 from contextlib import contextmanager
 from ema import LitEma
 from calc_fid_score import FIDEvaluation
 
-import os
 from loguru import logger
 import moviepy.editor as mpy
 from pathlib import Path
