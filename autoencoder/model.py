@@ -3,7 +3,10 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
-from autoencoder.modules.networks_ae import Encoder, Decoder, DiagonalGaussianDistribution
+try:
+    from autoencoder.modules.networks_ae import Encoder, Decoder, DiagonalGaussianDistribution
+except ModuleNotFoundError:
+    from modules.networks_ae import Encoder, Decoder, DiagonalGaussianDistribution
 
 
 class AutoencoderKL(nn.Module):

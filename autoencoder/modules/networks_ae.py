@@ -134,8 +134,7 @@ class Decoder(nn.Module):
     def __init__(self, channels, channel_mult, n_res_blocks, out_channels, z_channels, **kwargs):
         super().__init__()
         num_resolutions = len(channel_mult)
-        channel_list = [m * channels for m in channel_mult]
-        reversed(channel_list)
+        channel_list = [m * channels for m in channel_mult][::-1]
         channels = channel_list[0]
         
         self.conv_in = nn.Conv2d(z_channels, channels, 3, padding=1)
