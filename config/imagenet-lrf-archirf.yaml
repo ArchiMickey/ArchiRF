@@ -1,0 +1,70 @@
+hparams:
+  seed: 42
+  batch_size: 256
+  grad_accumulate_every: 1
+  lr: 1e-4
+  # max_grad_norm: 1.
+  n_steps: 1
+  # n_steps: 1
+  use_ema: true
+  ema_decay: 0.99
+
+datamodule:
+  _partial_: true
+  _target_: data.data_utils.ExperimentDataModule
+  dataset_name: imagenet
+  root: /mnt/g/ImageNet
+  image_size: 64
+  num_workers: 12
+
+model:
+  _target_: models.rf.LatentRectifiedFlow
+  channels: 16
+  image_size: 8
+  logit_normal_sampling_t: true
+  net:
+    _target_: modules.networks_archirf.IN1KMMDiT
+    embed_path: embeddings/in1k_embed-efficientnet_lite0.pth
+    input_size: ${model.image_size}
+    patch_size: 1
+    in_channels: ${model.channels}
+    dim: 384
+    depth: 12
+    num_heads: 8
+    num_classes: 1000
+    num_register_tokens: 4
+    rope_mixed: true
+    use_ape: false
+
+optimizer:
+  _partial_: true
+  _target_: bitsandbytes.optim.AdamW8bit
+  lr: ${hparams.lr}
+  eps: 1e-7
+
+lr_scheduler:
+  _partial_: true
+  _target_: modules.lr_scheduler.LinearWarmupLRSched
+  warmup_steps: 1000
+
+trainer:
+  _partial_: true
+  _target_: trainer.Trainer
+  accelerator:
+    _target_: accelerate.Accelerator
+    mixed_precision: bf16
+    log_with: wandb
+  log_dir: ./logs/imagenet/lrf
+  sampling_steps: 25
+  save_interval: 100000
+  sample_interval: 50000
+  sample_cfg_scales: [1.0, 2.5, 5.0]
+  fid_eval_interval: 100000
+  fid_stats_dir: ./results/imagenet
+  fid_cfg_scale: 5.0
+  num_fid_samples: 50000
+  logger_kwargs:
+    project_name: RF-Experiments
+    init_kwargs:
+      wandb:
+        name: imagenet-lrf-archirf
