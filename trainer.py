@@ -99,7 +99,6 @@ class Trainer:
         self.log_dir = Path(f"{log_dir}/{date_string}/{time_string}")
         if not self.log_dir.exists():
             self.log_dir.mkdir(parents=True, exist_ok=True)
-        self.ckpt_paths = []
 
     @contextmanager
     def ema_scope(self):
@@ -127,7 +126,6 @@ class Trainer:
         ckpt_path = self.log_dir / f"model-step{self.step}.ckpt"
         torch.save(state_dict, ckpt_path)
         logger.info(f"Saved checkpoint at {ckpt_path}")
-        self.ckpt_paths.append(ckpt_path)
 
     def load_ckpt(self, ckpt_path):
         accelerator = self.accelerator
@@ -234,8 +232,8 @@ class Trainer:
                             self.n_per_class
                         )
                     else:
-                        nrow = 4
-                        y = torch.randint(0, self.model.net.num_classes, (16,))
+                        nrow = 8
+                        y = torch.randint(0, self.model.net.num_classes, (64,))
                     batch_y = y.split(self.batch_size)
                     samples = []
                     samples_each_step = []
