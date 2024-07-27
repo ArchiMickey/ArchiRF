@@ -31,6 +31,10 @@ def main(cfg):
     )
     with open(f"{trainer.log_dir}/config.yaml", "w") as f:
         OmegaConf.save(cfg, f)
+        
+    if "ckpt_path" in cfg:
+        if cfg.ckpt_path is not None:
+            trainer.load_ckpt(cfg.ckpt_path)
 
     trainer.train()
 

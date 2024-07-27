@@ -51,7 +51,6 @@ class GANTrainer:
         ema_decay=0.9999,
         # misc
         log_dir=None,
-        save_interval=1000,
         sample_interval=1000,
         validate_interval=1000,
         logger_kwargs={},
@@ -79,7 +78,6 @@ class GANTrainer:
         self.max_grad_norm = max_grad_norm
         self.n_steps = n_steps
 
-        self.save_interval = save_interval
         self.sample_interval = sample_interval
         self.validate_interval = validate_interval
 
@@ -104,13 +102,13 @@ class GANTrainer:
     @contextmanager
     def ema_scope(self):
         if self.use_ema:
-            self.model_ema.store(self.model.parameters())
-            self.model_ema.copy_to(self.model)
+            self.generator_ema.store(self.generator.parameters())
+            self.generator_ema.copy_to(self.generator)
         try:
             yield None
         finally:
             if self.use_ema:
-                self.model_ema.restore(self.model.parameters())
+                self.generator_ema.restore(self.generator.parameters())
 
     def save_ckpt(self):
         state_dict = {
@@ -131,35 +129,33 @@ class GANTrainer:
         logger.info(f"Saved checkpoint at {ckpt_path}")
         self.ckpt_paths.append(ckpt_path)
 
-        # Remove old checkpoints if more than 3 exist
-        if len(self.ckpt_paths) > 3:
-            os.remove(self.ckpt_paths.pop(0))
-
     def load_ckpt(self, ckpt_path):
         accelerator = self.accelerator
         device = accelerator.device
 
         logger.info(f"Loading checkpoint from {ckpt_path}")
-        state_dict = torch.load(ckpt_path, map_location=device)
+        state_dict = torch.load(ckpt_path, map_location=device, weights_only=True)
 
         generator = accelerator.unwrap_model(self.generator)
         generator.load_state_dict(state_dict["generator"])
 
         discriminator = accelerator.unwrap_model(self.discriminator)
-        # discriminator.load_state_dict(state_dict["discriminator"], strict=False)
+        discriminator.load_state_dict(state_dict["discriminator"])
 
         self.opt_g.load_state_dict(state_dict["opt_g"])
-        # self.opt_d    .load_state_dict(state_dict["opt_d"], strict=False)
+        self.opt_d.load_state_dict(state_dict["opt_d"])
         self.step = state_dict["step"]
         if accelerator.scaler is not None:
             accelerator.scaler.load_state_dict(state_dict["scalar"])
         if self.use_ema:
             self.generator_ema.load_state_dict(state_dict["generator_ema"])
-
+        
+        self.step = state_dict["step"]
+    
     def train(self):
         self.accelerator.init_trackers(**self.logger_kwargs, config=self.config)
 
-        with tqdm(range(self.n_steps), desc="Training", dynamic_ncols=True) as pbar:
+        with tqdm(range(self.n_steps), desc="Training", dynamic_ncols=True) as pbar, self.accelerator.autocast():
             pbar.n = self.step
             pbar.last_print_n = self.step
 
@@ -173,25 +169,25 @@ class GANTrainer:
                     data = next(self.dl)
                     x, _ = data
                     x = x.to(self.device)
-                    with self.accelerator.autocast():
-                        x_recon, _ = self.generator(x)
-                        loss_d, loss_dict_d = self.loss_fn.discriminator_step(
-                            x, x_recon.clone().detach(), self.discriminator, self.step
-                        )
-                        loss_d = loss_d / self.grad_accumulate_every
-                        total_d_loss += loss_d.item()
+                    
+                    x_recon, _ = self.generator(x)
+                    loss_d, loss_dict_d = self.loss_fn.discriminator_step(
+                        x, x_recon.clone().detach(), self.discriminator, self.step
+                    )
+                    loss_d = loss_d / self.grad_accumulate_every
+                    total_d_loss += loss_d.item()
 
-                        for k, v in loss_dict_d.items():
-                            if "logits" in k:
-                                if k not in total_loss_dict_d:
-                                    total_loss_dict_d[k] = []
-                                total_loss_dict_d[k].extend(v)
-                            else:
-                                if k not in total_loss_dict_d:
-                                    total_loss_dict_d[k] = 0.0
-                                total_loss_dict_d[k] += v / self.grad_accumulate_every
+                    for k, v in loss_dict_d.items():
+                        if "logits" in k:
+                            if k not in total_loss_dict_d:
+                                total_loss_dict_d[k] = []
+                            total_loss_dict_d[k].extend(v)
+                        else:
+                            if k not in total_loss_dict_d:
+                                total_loss_dict_d[k] = 0.0
+                            total_loss_dict_d[k] += v / self.grad_accumulate_every
 
-                        self.accelerator.backward(loss_d)
+                    self.accelerator.backward(loss_d)
 
                 self.accelerator.clip_grad_norm_(
                     self.discriminator.parameters(), self.max_grad_norm
@@ -207,25 +203,25 @@ class GANTrainer:
                     data = next(self.dl)
                     x, _ = data
                     x = x.to(self.device)
-                    with self.accelerator.autocast():
-                        x_recon, z = self.generator(x)
-                        loss_g, loss_dict_g = self.loss_fn.generator_step(
-                            x,
-                            x_recon,
-                            z,
-                            self.discriminator,
-                            self.generator.get_last_layer(),
-                            self.step,
-                        )
-                        loss_g = loss_g / self.grad_accumulate_every
-                        total_g_loss += loss_g.item()
 
-                        for k, v in loss_dict_g.items():
-                            if k not in total_loss_dict_g:
-                                total_loss_dict_g[k] = 0.0
-                            total_loss_dict_g[k] += v / self.grad_accumulate_every
+                    x_recon, z = self.generator(x)
+                    loss_g, loss_dict_g = self.loss_fn.generator_step(
+                        x,
+                        x_recon,
+                        z,
+                        self.discriminator,
+                        self.generator.get_last_layer(),
+                        self.step,
+                    )
+                    loss_g = loss_g / self.grad_accumulate_every
+                    total_g_loss += loss_g.item()
 
-                        self.accelerator.backward(loss_g)
+                    for k, v in loss_dict_g.items():
+                        if k not in total_loss_dict_g:
+                            total_loss_dict_g[k] = 0.0
+                        total_loss_dict_g[k] += v / self.grad_accumulate_every
+
+                    self.accelerator.backward(loss_g)
 
                 self.accelerator.clip_grad_norm_(
                     self.generator.parameters(), self.max_grad_norm
@@ -274,7 +270,7 @@ class GANTrainer:
                     self.step,
                 )
 
-                if self.step % 100 == 0:
+                if self.step % 25 == 0:
                     self.log_gradients()
 
                 if self.gen_lr_scheduler is not None:
@@ -282,15 +278,18 @@ class GANTrainer:
                 if self.disc_lr_scheduler is not None:
                     self.disc_lr_scheduler.step()
 
-                if self.step % self.save_interval == 0:
-                    self.save_ckpt()
-
                 if self.step % self.sample_interval == 0:
                     self.log_samples(x, x_recon)
 
                 if self.step % self.validate_interval == 0:
+                    self.generator.eval()
+                    self.discriminator.eval()
                     with self.ema_scope():
                         self.validate()
+                    self.save_ckpt()
+                    self.generator.train()
+                    self.discriminator.train()
+                    
 
         self.accelerator.end_training()
 
@@ -310,7 +309,7 @@ class GANTrainer:
         self.accelerator.log({**generator_grad, **discriminator_grad}, self.step)
 
     def log_samples(self, x, x_recon, split="train"):
-        x, x_recon = unnormalize_to_0_1(x), unnormalize_to_0_1(x_recon)
+        x, x_recon = unnormalize_to_0_1(x), unnormalize_to_0_1(x_recon.clip(-1, 1))
         x, x_recon = make_grid(x), make_grid(x_recon)
         logging_x, logging_x_recon = wandb.Image(
             x, caption="Ground-Truth"
@@ -334,9 +333,8 @@ class GANTrainer:
         features = rearrange(features, "... 1 1 -> ...")
         return features
 
+    @torch.no_grad()
     def validate(self):
-        self.generator.eval()
-        self.discriminator.eval()
         dl = self.datamodule.get_val_dataloader()
 
         total_loss_dict_g = {}
@@ -346,43 +344,46 @@ class GANTrainer:
         stacked_fake_features = []
 
         num_batch = 0
-        for batch in tqdm(dl):
-            x, _ = batch
-            x = x.to(self.device)
-            with torch.no_grad():
-                with self.accelerator.autocast():
-                    x_recon, z = self.generator(x)
-                    _, loss_dict_g = self.loss_fn.generator_step(
-                        x, x_recon, z, self.discriminator, None, self.step
-                    )
+        
+        with tqdm(dl, desc="Validating", dynamic_ncols=True) as pbar:
+            for i, batch in enumerate(pbar):
+                x, _ = batch
+                x = x.to(self.device)
+                
+                x_recon, z = self.generator(x)
+                _, loss_dict_g = self.loss_fn.generator_step(
+                    x, x_recon, z, self.discriminator, None, self.step
+                )
 
-                    for k, v in loss_dict_g.items():
-                        if k not in total_loss_dict_g:
-                            total_loss_dict_g[k] = 0.0
-                        total_loss_dict_g[k] += v
+                for k, v in loss_dict_g.items():
+                    if k not in total_loss_dict_g:
+                        total_loss_dict_g[k] = 0.0
+                    total_loss_dict_g[k] += v
 
-                    _, loss_dict_d = self.loss_fn.discriminator_step(
-                        x, x_recon, self.discriminator, self.step
-                    )
+                _, loss_dict_d = self.loss_fn.discriminator_step(
+                    x, x_recon, self.discriminator, self.step
+                )
 
-                    for k, v in loss_dict_d.items():
-                        if "logits" in k:
-                            if k not in total_loss_dict_d:
-                                total_loss_dict_d[k] = []
-                            total_loss_dict_d[k].extend(v)
-                        else:
-                            if k not in total_loss_dict_d:
-                                total_loss_dict_d[k] = 0.0
-                            total_loss_dict_d[k] += v
+                for k, v in loss_dict_d.items():
+                    if "logits" in k:
+                        if k not in total_loss_dict_d:
+                            total_loss_dict_d[k] = []
+                        total_loss_dict_d[k].extend(v)
+                    else:
+                        if k not in total_loss_dict_d:
+                            total_loss_dict_d[k] = 0.0
+                        total_loss_dict_d[k] += v
 
-            real_features = self.calculate_inception_features(unnormalize_to_0_1(x))
-            fake_features = self.calculate_inception_features(
-                unnormalize_to_0_1(x_recon)
-            )
-            stacked_real_features.append(real_features)
-            stacked_fake_features.append(fake_features)
+                real_features = self.calculate_inception_features(unnormalize_to_0_1(x))
+                fake_features = self.calculate_inception_features(
+                    unnormalize_to_0_1(x_recon.clip(-1, 1))
+                )
+                stacked_real_features.append(real_features)
+                stacked_fake_features.append(fake_features)
 
-            num_batch += 1
+                num_batch += 1
+                if i == 42:
+                    self.log_samples(x, x_recon, split="val")
 
         total_loss_dict_g = {
             f"val/gen_{k}": v / num_batch for k, v in total_loss_dict_g.items()
@@ -414,8 +415,3 @@ class GANTrainer:
             },
             self.step,
         )
-
-        self.log_samples(x, x_recon, split="val")
-
-        self.generator.train()
-        self.discriminator.train()

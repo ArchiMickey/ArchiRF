@@ -44,7 +44,8 @@ def main(cfg):
         OmegaConf.save(cfg, f)
     
     if "ckpt_path" in cfg:
-        trainer.load_ckpt(cfg.ckpt_path)
+        if cfg.ckpt_path is not None:
+            trainer.load_ckpt(cfg.ckpt_path)
 
     trainer.train()
 

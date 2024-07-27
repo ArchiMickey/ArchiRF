@@ -42,7 +42,6 @@ class Trainer:
         # misc
         log_dir=None,
         sampling_steps=100,
-        save_interval=1000,
         sample_interval=1000,
         sample_cfg_scales=[1.0, 1.25, 1.5],
         n_per_class=10,
@@ -67,7 +66,6 @@ class Trainer:
         self.max_grad_norm = max_grad_norm
         self.n_steps = n_steps
 
-        self.save_interval = save_interval
         self.sampling_steps = sampling_steps
         self.sample_interval = sample_interval
         self.sample_cfg_scales = sample_cfg_scales
@@ -132,7 +130,7 @@ class Trainer:
         device = accelerator.device
 
         logger.info(f"Loading checkpoint from {ckpt_path}")
-        state_dict = torch.load(ckpt_path, map_location=device)
+        state_dict = torch.load(ckpt_path, map_location=device, weights_only=True)
 
         model = accelerator.unwrap_model(self.model)
         model.load_state_dict(state_dict["model"])
@@ -147,8 +145,11 @@ class Trainer:
     def train(self):
         self.accelerator.init_trackers(**self.logger_kwargs, config=self.config)
 
-        with tqdm(range(self.n_steps), desc="Training", dynamic_ncols=True) as pbar:
-            pbar.update(self.step)
+        with tqdm(
+            range(self.n_steps), desc="Training", dynamic_ncols=True
+        ) as pbar, self.accelerator.autocast():
+            pbar.n = self.step
+            pbar.last_print_n = self.step
 
             for _ in pbar:
                 self.opt.zero_grad()
@@ -162,10 +163,9 @@ class Trainer:
                         x, c = data["latent"], data["label"]
                     x, c = x.to(self.device), c.to(self.device)
 
-                    with self.accelerator.autocast():
-                        loss = self.model(x, c)
-                        loss = loss / self.grad_accumulate_every
-                        total_loss += loss.item()
+                    loss = self.model(x, c)
+                    loss = loss / self.grad_accumulate_every
+                    total_loss += loss.item()
 
                     self.accelerator.backward(loss)
 
@@ -180,29 +180,27 @@ class Trainer:
 
                 lr = self.opt.param_groups[0]["lr"]
                 pbar.set_postfix({"loss": total_loss, "lr": lr})
-                
+
                 self.accelerator.log(
-                        {"loss": total_loss, "step": self.step, "lr": lr}, self.step
-                    )
+                    {"loss": total_loss, "step": self.step, "lr": lr}, self.step
+                )
                 if self.step % 25 == 0:
                     self.log_gradients()
 
                 if self.lr_scheduler is not None:
                     self.lr_scheduler.step()
 
-                if self.step % self.save_interval == 0:
-                    self.save_ckpt()
-
                 if self.step % self.sample_interval == 0:
                     self.model.eval()
-                    self.log_samples()
+                    with self.ema_scope():
+                        self.log_samples()
                     self.model.train()
 
                 if self.step % self.fid_eval_interval == 0:
                     self.model.eval()
                     with self.ema_scope():
-                        with self.accelerator.autocast():
-                            fid_score = self.fid_scorer.fid_score(self.fid_cfg_scale)
+                        fid_score = self.fid_scorer.fid_score(self.fid_cfg_scale)
+                    self.save_ckpt()
                     self.model.train()
 
                     logger.info(f"FID score at step {self.step}: {fid_score}")
@@ -219,118 +217,116 @@ class Trainer:
 
         self.accelerator.log(grad, self.step)
 
+    @torch.no_grad()
     def log_samples(self):
-        with self.ema_scope():
-            if self.model.use_cond:
-                logging_images = []
-                logging_animations = []
-                for cfg_scale in self.sample_cfg_scales:
-                    num_classes = self.model.net.num_classes
-                    if num_classes <= 10:
-                        nrow = num_classes
-                        y = torch.arange(0, self.model.net.num_classes).repeat(
-                            self.n_per_class
-                        )
-                    else:
-                        nrow = 8
-                        y = torch.randint(0, self.model.net.num_classes, (64,))
-                    batch_y = y.split(self.batch_size)
-                    samples = []
-                    samples_each_step = []
-
-                    for _y in batch_y:
-                        with self.accelerator.autocast():
-                            _samples, _samples_each_step = self.model.cond_sample(
-                                _y,
-                                self.device,
-                                sampling_steps=self.sampling_steps,
-                                cfg_scale=cfg_scale,
-                                return_all_steps=True,
-                            )
-
-                        samples.append(_samples)
-                        samples_each_step.append(_samples_each_step)
-
-                    samples = torch.cat(samples)
-                    samples = make_grid(samples, nrow=nrow)
-                    save_image(
-                        samples,
-                        f"{self.log_dir}/samples_{self.step}_cfg{cfg_scale}.png",
+        if self.model.use_cond:
+            logging_images = []
+            logging_animations = []
+            for cfg_scale in self.sample_cfg_scales:
+                num_classes = self.model.net.num_classes
+                if num_classes <= 10:
+                    nrow = num_classes
+                    y = torch.arange(0, self.model.net.num_classes).repeat(
+                        self.n_per_class
                     )
-                    logger.info(
-                        f"Saved samples at {self.log_dir}/samples_{self.step}_cfg{cfg_scale}.png"
-                    )
-
-                    samples_each_step = torch.cat(samples_each_step, dim=1)
-                    frames = [
-                        make_grid(s.float(), nrow=nrow).permute(1, 2, 0).cpu().numpy()
-                        * 255
-                        for s in samples_each_step
-                    ]
-                    clip = mpy.ImageSequenceClip(frames, fps=len(frames) // 5)
-                    clip.write_gif(
-                        f"{self.log_dir}/samples_{self.step}_cfg{cfg_scale}.gif",
-                    )
-
-                    if self.accelerator.get_tracker("wandb") is not None:
-                        logging_images.append(
-                            wandb.Image(
-                                f"{self.log_dir}/samples_{self.step}_cfg{cfg_scale}.png",
-                                caption=f"cfg_scale={cfg_scale}",
-                            )
-                        )
-                        logging_animations.append(
-                            wandb.Video(
-                                f"{self.log_dir}/samples_{self.step}_cfg{cfg_scale}.gif",
-                                caption=f"cfg_scale={cfg_scale}",
-                            )
-                        )
-                if self.accelerator.get_tracker("wandb") is not None:
-                    self.accelerator.log(
-                        {
-                            "samples/images": logging_images,
-                            "samples/animations": logging_animations,
-                        },
-                        self.step,
-                    )
-
-            else:
-                batch_batch_size = num_to_groups(100, self.batch_size // 2)
+                else:
+                    nrow = 8
+                    y = torch.randint(0, self.model.net.num_classes, (64,))
+                batch_y = y.split(self.batch_size)
                 samples = []
                 samples_each_step = []
 
-                for _b in batch_batch_size:
-                    _samples, _samples_each_step = self.model.sample(
-                        _b,
+                for _y in batch_y:
+                    _samples, _samples_each_step = self.model.cond_sample(
+                        _y,
                         self.device,
                         sampling_steps=self.sampling_steps,
+                        cfg_scale=cfg_scale,
                         return_all_steps=True,
                     )
+
                     samples.append(_samples)
                     samples_each_step.append(_samples_each_step)
 
                 samples = torch.cat(samples)
-                samples_each_step = torch.cat(samples_each_step)
-                samples = make_grid(samples, nrow=10)
-                save_image(samples, f"{self.log_dir}/samples_{self.step}.png")
-                logger.info(f"Saved samples at {self.log_dir}/samples_{self.step}.png")
+                samples = make_grid(samples, nrow=nrow)
+                save_image(
+                    samples,
+                    f"{self.log_dir}/samples_{self.step}_cfg{cfg_scale}.png",
+                )
+                logger.info(
+                    f"Saved samples at {self.log_dir}/samples_{self.step}_cfg{cfg_scale}.png"
+                )
 
+                samples_each_step = torch.cat(samples_each_step, dim=1)
                 frames = [
-                    make_grid(s, nrow=10).permute(1, 2, 0).cpu().numpy() * 255
+                    make_grid(s.float(), nrow=nrow).permute(1, 2, 0).cpu().numpy() * 255
                     for s in samples_each_step
                 ]
-                clip = mpy.ImageSequenceClip(frames, fps=10)
-                clip.write_gif(f"{self.log_dir}/samples_{self.step}.gif", fps=10)
+                clip = mpy.ImageSequenceClip(frames, fps=len(frames) // 5)
+                clip.write_gif(
+                    f"{self.log_dir}/samples_{self.step}_cfg{cfg_scale}.gif",
+                )
 
                 if self.accelerator.get_tracker("wandb") is not None:
-                    self.accelerator.log(
-                        {
-                            "samples/images": wandb.Image(
-                                f"{self.log_dir}/samples_{self.step}.png"
-                            ),
-                            "samples/animations": wandb.Video(
-                                f"{self.log_dir}/samples_{self.step}.gif"
-                            ),
-                        },
-                        self.step,
+                    logging_images.append(
+                        wandb.Image(
+                            f"{self.log_dir}/samples_{self.step}_cfg{cfg_scale}.png",
+                            caption=f"cfg_scale={cfg_scale}",
+                        )
                     )
+                    logging_animations.append(
+                        wandb.Video(
+                            f"{self.log_dir}/samples_{self.step}_cfg{cfg_scale}.gif",
+                            caption=f"cfg_scale={cfg_scale}",
+                        )
+                    )
+            if self.accelerator.get_tracker("wandb") is not None:
+                self.accelerator.log(
+                    {
+                        "samples/images": logging_images,
+                        "samples/animations": logging_animations,
+                    },
+                    self.step,
+                )
+
+        else:
+            batch_batch_size = num_to_groups(100, self.batch_size // 2)
+            samples = []
+            samples_each_step = []
+
+            for _b in batch_batch_size:
+                _samples, _samples_each_step = self.model.sample(
+                    _b,
+                    self.device,
+                    sampling_steps=self.sampling_steps,
+                    return_all_steps=True,
+                )
+                samples.append(_samples)
+                samples_each_step.append(_samples_each_step)
+
+            samples = torch.cat(samples)
+            samples_each_step = torch.cat(samples_each_step)
+            samples = make_grid(samples, nrow=10)
+            save_image(samples, f"{self.log_dir}/samples_{self.step}.png")
+            logger.info(f"Saved samples at {self.log_dir}/samples_{self.step}.png")
+
+            frames = [
+                make_grid(s, nrow=10).permute(1, 2, 0).cpu().numpy() * 255
+                for s in samples_each_step
+            ]
+            clip = mpy.ImageSequenceClip(frames, fps=10)
+            clip.write_gif(f"{self.log_dir}/samples_{self.step}.gif", fps=10)
+
+            if self.accelerator.get_tracker("wandb") is not None:
+                self.accelerator.log(
+                    {
+                        "samples/images": wandb.Image(
+                            f"{self.log_dir}/samples_{self.step}.png"
+                        ),
+                        "samples/animations": wandb.Video(
+                            f"{self.log_dir}/samples_{self.step}.gif"
+                        ),
+                    },
+                    self.step,
+                )
