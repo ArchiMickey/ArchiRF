@@ -64,31 +64,6 @@ At this stage, I will to level up this repo by implementing and training a [late
 3. Larger Latent Channels
     According to SD3 paper, the larger output latent channels can produce better image quality.
 
-#### What's wrong with VAE?
-There are already a few discussions about the issues of VAE in Stable Diffusion. FYR, you can check the links below:
-- https://news.ycombinator.com/item?id=39215242
-- https://news.ycombinator.com/item?id=39215949
-- https://www.reddit.com/r/StableDiffusion/comments/1agd5pz/a_recent_post_went_viral_claiming_that_the_vae_is/?sort=new
-
-I can summarize the problems of VAE as follows:
-1. The output latent of the encoder is not bounded to [-1, 1] with variance 0. This can introduce more difficulties in the diffusion process because we denoise the latent from a noise from a normal distribution. The scaling factor in VAE of SD cannot guarantee the latent to be in the range [-1, 1].
-2. KL regularization is not enough to prevent the encoder from limiting the latent space.
-3. VAE is not the only option for latent diffusion. VQVAE is also been tested in the original paper. But why don't we try a vanilla autoencoder? Given the fact that people found out the variance term in VAE is not necessary to get a good quality of output image. (See the third link above)
-
-#### Custom Autoencoder
-Grouping the ideas from others, I implemented a custom autoencoder for latent diffusion. The custom autoencoder has the same architecture with my AutoencoderKL model, but having a few modifications:
-1. the encoded latent is clipped to [-1, 1]
-2. variance term is not needed because we don't need to sample from a normal distribution
-3. the autoencoder is trained with the same loss functions introduced with original one in stable diffusion. However, instead of using KL divergence, I use a simple variance loss term to guide the latent space to have a standard deviation of 1.
-4. A gain parameter is added to the autoencoder to scale the latent space. It is reasonable that the encoded latent is not always having a normal distribution. Besides, simply clipping the latents may produce feature loss. The gain parameter can help to scale for better results.
-
-##### Findings on the custom autoencoder
-1. Without the scaling term, the autoencoder is more diffusion to train. From my runs, the loss of the autoencoder is dropping slower without the scaling term.
-2. The variance loss term needs scaling. I found out that the variance loss term is too large to train the autoencoder. I scale the variance loss term by 0.01 to get a better result.
-3. As the training goes on, the autoencoder will have a better variance of the latent space while the scaling term keeps decreasing.
-
-I may try to train the autoencoder with more modern GAN techniques like projected GAN or Squeeze-and-Excitation in the generator. But I think it is not necessary for now.
-
 ### Latent Rectified Flow (Still Training?)
 After all, I can use the trained autoencoder to train a latent rectified model. I found that training a latent diffusion/rf model is way harder than training one on pixel space.
 
@@ -101,3 +76,16 @@ Samples of generating some classes in ImageNet with MMDiT and Latent RF:
 For autoencoder, please check `autoencoder/train.py` for training a autoencoder model.
 For DDPM/RF, please check `train.py` for training a DDPM/RF model.
 You can refer to the config files in each `config` directory to see the training configurations.
+
+To train an autoencoder:
+```bash
+cd autoencoder
+python train.py --config-name {CONFIG_NAME}
+```
+with a config in `autoencoder/config` directory.
+
+To train a DDPM/RF model:
+```bash
+python train.py --config-name {CONFIG_NAME}
+```
+with a config in `config` directory.
