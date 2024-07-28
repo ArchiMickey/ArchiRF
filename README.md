@@ -11,34 +11,34 @@ This is a part mentioning what I have done in this project. I may keep updating 
 
 ### First stage
 
-1. Code for DDPM and Rectified Flow
+1. Code for DDPM and Rectified Flow \
    You can find the code in the `models` directory. `rf.py` contains the implementation of the Rectified Flow model, and `ddpm.py` contains the implementation of the DDPM model.
-2. Code for different model architectures
+2. Code for different model architectures \
     You can see different networks architectures in the `modules` directory. Up to now, I have implemented these networks:
     - [Diffusion Transformer](https://arxiv.org/abs/2212.09748) `modules/networks_dit.py`
     - Multi-modal Diffusion Transformer (MMDiT) from [Stable Diffusion 3](https://arxiv.org/abs/2403.12015) `modules/networks_mmdit.py`
     - Unet from [EDM2](https://arxiv.org/abs/2312.02696) paper `modules/networks_karras_unet.py`
     - Classic [ADM](https://arxiv.org/abs/2105.05233) Unet `modules/networks_unet.py`
-3. Learning rate scheduler
+3. Learning rate scheduler \
     I have implemented these learning rate schedulers in `modules/lr_scheduler.py`:
-    1. Linear warmup scheduler
+    1. Linear warmup scheduler \
     According to the Stable Diffusion 3's paper, the authors use a linear warmup scheduler to warm up the learning rate in the first 1000 iterations.
-    2. Inverse square root scheduler
+    2. Inverse square root scheduler \
     Authors of EDM2 states that using an inverse square root scheduler can improve the performance of the model given the magnitude preserving techniques of the network.
 
-4. ViT with Registers
-    I have implemented registers for ViT which is introduces in the paper [VISION TRANSFORMERS NEED REGISTERS](https://arxiv.org/pdf/2309.16588). Registers are used by default.
-    ```python
-    from modules.networks_dit import DiT
-    net = DiT(num_register_tokens=4) # 4 registers by default
-    ```
+4. ViT with Registers \
+  I have implemented registers for ViT which is introduces in the paper [VISION TRANSFORMERS NEED REGISTERS](https://arxiv.org/pdf/2309.16588). Registers are used by default.
+  ```python
+  from modules.networks_dit import DiT
+  net = DiT(num_register_tokens=4) # 4 registers by default
+  ```
 #### MMDiT
 I have implemented the MMDiT network. Following the paper, I made several changes to both the rectified flow framework and diffusion transformer's architecture: 
 
-1. QK normalization
-    This can prevent explosion in the attention logits.
-2. Logit-Normal Sampling for $t$
-    I use the logit-normal distribution to sample $t$ in the rectified flow model. This is said to be better then the uniform distribution.
+1. QK normalization \
+  This can prevent explosion in the attention logits.
+2. Logit-Normal Sampling for $t$ \
+I use the logit-normal distribution to sample $t$ in the rectified flow model. This is said to be better then the uniform distribution.
 
 However, with limited computational resources, I can't train a text-to-image model. I use two class embeddings to simulate the text embeddings. However, I found out training the embeddings is very hard given a large number of classes in ImageNet. According to the StyleGAN-XL paper, it is possible to use pretrained class embeddings from a pretrained image classification model(Efficientnet-lite0 in their paper). They pool the image features at the last layer to act as class embeddings. I may try this method in the future.
 
@@ -55,14 +55,14 @@ Animation:
 
 At this stage, I will to level up this repo by implementing and training a [latent diffusion](https://arxiv.org/abs/2112.10752) model from scratch by myself. Most of the code on this stage are in the `autoencoder` directory. Due to limited computational resources, I will the Autoencoder model on ImageNet dataset with 64x64 resolution. After encoding the images with shape `[B, 3, 64, 64]`, I can get a latent features with shape `[B, 16, 8, 8]`.
 
-1. AutoencoderKL
-    Following the paper, I implemented the classic VAE model with KL divergence loss.
+1. AutoencoderKL \
+Following the paper, I implemented the classic VAE model with KL divergence loss.
 
-2. Custom Autoencoder for latent diffusion
-    Based on the problem of the classic VAE model, I implemented a custom autoencoder which imo is more suitable for latent diffusion model. The custom autoencoder will be explained in the next part.
+2. Custom Autoencoder for latent diffusion \
+Based on the problem of the classic VAE model, I implemented a custom autoencoder which imo is more suitable for latent diffusion model. The custom autoencoder will be explained in the next part.
 
-3. Larger Latent Channels
-    According to SD3 paper, the larger output latent channels can produce better image quality.
+3. Larger Latent Channels \
+According to SD3 paper, the larger output latent channels can produce better image quality.
 
 ### Latent Rectified Flow (Still Training?)
 After all, I can use the trained autoencoder to train a latent rectified model. I found that training a latent diffusion/rf model is way harder than training one on pixel space.
