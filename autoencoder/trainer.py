@@ -284,8 +284,6 @@ class GANTrainer:
                     self.log_samples(x, x_recon)
 
                 if self.step % self.validate_interval == 0:
-                    self.generator.eval()
-                    self.discriminator.eval()
                     with self.ema_scope():
                         self.validate()
                     self.save_ckpt()
