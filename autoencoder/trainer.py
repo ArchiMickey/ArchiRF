@@ -332,8 +332,8 @@ class GANTrainer:
 
     @torch.no_grad()
     def validate(self):
-        self.generator.val()
-        self.discriminator.val()
+        self.generator.eval()
+        self.discriminator.eval()
         dl = self.datamodule.get_val_dataloader()
 
         total_loss_dict_g = {}
