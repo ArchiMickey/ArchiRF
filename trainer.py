@@ -147,7 +147,7 @@ class Trainer:
 
         with tqdm(
             range(self.n_steps), desc="Training", dynamic_ncols=True
-        ) as pbar, self.accelerator.autocast():
+        ) as pbar:
             pbar.n = self.step
             pbar.last_print_n = self.step
 
@@ -199,7 +199,8 @@ class Trainer:
                 if self.step % self.fid_eval_interval == 0:
                     self.model.eval()
                     with self.ema_scope():
-                        fid_score = self.fid_scorer.fid_score(self.fid_cfg_scale)
+                        with self.accelerator.autocast():
+                            fid_score = self.fid_scorer.fid_score(self.fid_cfg_scale)
                     self.save_ckpt()
                     self.model.train()
 
@@ -237,13 +238,14 @@ class Trainer:
                 samples_each_step = []
 
                 for _y in batch_y:
-                    _samples, _samples_each_step = self.model.cond_sample(
-                        _y,
-                        self.device,
-                        sampling_steps=self.sampling_steps,
-                        cfg_scale=cfg_scale,
-                        return_all_steps=True,
-                    )
+                    with self.accelerator.autocast():
+                        _samples, _samples_each_step = self.model.cond_sample(
+                            _y,
+                            self.device,
+                            sampling_steps=self.sampling_steps,
+                            cfg_scale=cfg_scale,
+                            return_all_steps=True,
+                        )
 
                     samples.append(_samples)
                     samples_each_step.append(_samples_each_step)
@@ -296,12 +298,14 @@ class Trainer:
             samples_each_step = []
 
             for _b in batch_batch_size:
-                _samples, _samples_each_step = self.model.sample(
-                    _b,
-                    self.device,
-                    sampling_steps=self.sampling_steps,
-                    return_all_steps=True,
-                )
+                with self.accelerator.autocast():
+                    _samples, _samples_each_step = self.model.sample(
+                        _b,
+                        self.device,
+                        sampling_steps=self.sampling_steps,
+                        cfg_scale=cfg_scale,
+                        return_all_steps=True,
+                    )
                 samples.append(_samples)
                 samples_each_step.append(_samples_each_step)
 

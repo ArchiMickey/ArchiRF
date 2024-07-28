@@ -170,10 +170,11 @@ class GANTrainer:
                     x, _ = data
                     x = x.to(self.device)
                     
-                    x_recon, _ = self.generator(x)
-                    loss_d, loss_dict_d = self.loss_fn.discriminator_step(
-                        x, x_recon.clone().detach(), self.discriminator, self.step
-                    )
+                    with self.accelerator.autocast():
+                        x_recon, _ = self.generator(x)
+                        loss_d, loss_dict_d = self.loss_fn.discriminator_step(
+                            x, x_recon.clone().detach(), self.discriminator, self.step
+                        )
                     loss_d = loss_d / self.grad_accumulate_every
                     total_d_loss += loss_d.item()
 
@@ -204,15 +205,16 @@ class GANTrainer:
                     x, _ = data
                     x = x.to(self.device)
 
-                    x_recon, z = self.generator(x)
-                    loss_g, loss_dict_g = self.loss_fn.generator_step(
-                        x,
-                        x_recon,
-                        z,
-                        self.discriminator,
-                        self.generator.get_last_layer(),
-                        self.step,
-                    )
+                    with self.accelerator.autocast():
+                        x_recon, z = self.generator(x)
+                        loss_g, loss_dict_g = self.loss_fn.generator_step(
+                            x,
+                            x_recon,
+                            z,
+                            self.discriminator,
+                            self.generator.get_last_layer(),
+                            self.step,
+                        )
                     loss_g = loss_g / self.grad_accumulate_every
                     total_g_loss += loss_g.item()
 
@@ -287,9 +289,6 @@ class GANTrainer:
                     with self.ema_scope():
                         self.validate()
                     self.save_ckpt()
-                    self.generator.train()
-                    self.discriminator.train()
-                    
 
         self.accelerator.end_training()
 
@@ -335,6 +334,8 @@ class GANTrainer:
 
     @torch.no_grad()
     def validate(self):
+        self.generator.val()
+        self.discriminator.val()
         dl = self.datamodule.get_val_dataloader()
 
         total_loss_dict_g = {}
@@ -350,20 +351,22 @@ class GANTrainer:
                 x, _ = batch
                 x = x.to(self.device)
                 
-                x_recon, z = self.generator(x)
-                _, loss_dict_g = self.loss_fn.generator_step(
-                    x, x_recon, z, self.discriminator, None, self.step
-                )
+                with self.accelerator.autocast():
+                    x_recon, z = self.generator(x)
+                    _, loss_dict_g = self.loss_fn.generator_step(
+                        x, x_recon, z, self.discriminator, None, self.step
+                    )
 
                 for k, v in loss_dict_g.items():
                     if k not in total_loss_dict_g:
                         total_loss_dict_g[k] = 0.0
                     total_loss_dict_g[k] += v
 
-                _, loss_dict_d = self.loss_fn.discriminator_step(
-                    x, x_recon, self.discriminator, self.step
-                )
-
+                with self.accelerator.autocast():
+                    _, loss_dict_d = self.loss_fn.discriminator_step(
+                        x, x_recon, self.discriminator, self.step
+                    )
+                
                 for k, v in loss_dict_d.items():
                     if "logits" in k:
                         if k not in total_loss_dict_d:
@@ -394,8 +397,8 @@ class GANTrainer:
             if "logits" not in k
         }
 
-        stacked_real_features = torch.cat(stacked_real_features, dim=0).cpu().numpy()
-        stacked_fake_features = torch.cat(stacked_fake_features, dim=0).cpu().numpy()
+        stacked_real_features = torch.cat(stacked_real_features, dim=0).cpu().float().numpy()
+        stacked_fake_features = torch.cat(stacked_fake_features, dim=0).cpu().float().numpy()
         m2, s2 = np.mean(stacked_real_features, axis=0), np.cov(
             stacked_real_features, rowvar=False
         )
@@ -415,3 +418,6 @@ class GANTrainer:
             },
             self.step,
         )
+
+        self.generator.train()
+        self.discriminator.train()
