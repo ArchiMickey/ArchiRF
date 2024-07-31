@@ -175,7 +175,10 @@ class DoubleAttention(nn.Module):
             torch.cat([v1, v2], dim=-2),
         )
 
-        if flash_attn_func is not None:
+        if (
+            x.dtype in [torch.float16, torch.bfloat16]
+            and flash_attn_func is not None
+        ):
             q, k, v = map(lambda t: rearrange(t, "b h n d -> b n h d"), (q, k, v))
             x = flash_attn_func(q, k, v, self.attn_drop.p if self.training else 0)
             x = rearrange(x, "b n h d -> b n (h d)")
@@ -195,13 +198,13 @@ class DoubleAttention(nn.Module):
 class MMDiTBlock(nn.Module):
     def __init__(self, dim, num_heads, mlp_ratio=4.0):
         super().__init__()
-        self.norm1_1 = RMSNorm(dim)
-        self.norm1_2 = RMSNorm(dim)
+        self.norm1_1 = nn.LayerNorm(dim, elementwise_affine=False, eps=1e-6)
+        self.norm1_2 = nn.LayerNorm(dim, elementwise_affine=False, eps=1e-6)
         self.attn = DoubleAttention(
             dim, num_heads=num_heads, qkv_bias=True, qk_norm=True, norm_layer=RMSNorm
         )
-        self.norm2_1 = RMSNorm(dim)
-        self.norm2_2 = RMSNorm(dim)
+        self.norm2_1 = nn.LayerNorm(dim, elementwise_affine=False, eps=1e-6)
+        self.norm2_2 = nn.LayerNorm(dim, elementwise_affine=False, eps=1e-6)
         mlp_dim = int(dim * mlp_ratio)
         approx_gelu = lambda: nn.GELU(approximate="tanh")
         self.mlp_1 = Mlp(
@@ -210,6 +213,7 @@ class MMDiTBlock(nn.Module):
         self.mlp_2 = Mlp(
             in_features=dim, hidden_features=mlp_dim, act_layer=approx_gelu, drop=0
         )
+
         self.adaLN_modulation_1 = nn.Sequential(nn.SiLU(), nn.Linear(dim, 6 * dim))
         self.adaLN_modulation_2 = nn.Sequential(nn.SiLU(), nn.Linear(dim, 6 * dim))
 
@@ -239,13 +243,12 @@ class MMDiTBlock(nn.Module):
 class FinalLayer(nn.Module):
     def __init__(self, dim, patch_size, out_dim):
         super().__init__()
-        self.norm_final = RMSNorm(dim)
         self.linear = nn.Linear(dim, patch_size * patch_size * out_dim)
-        self.adaLN_modulation = nn.Sequential(nn.SiLU(), nn.Linear(dim, 2 * dim))
+        self.modulation = nn.Sequential(nn.SiLU(), nn.Linear(dim, 2 * dim))
 
     def forward(self, x, c):
-        shift, scale = self.adaLN_modulation(c).chunk(2, dim=-1)
-        x = modulate(self.norm_final(x), shift, scale)
+        shift, scale = self.modulation(c).chunk(2, dim=-1)
+        x = modulate(x, shift, scale)
         x = self.linear(x)
         return x
 
@@ -272,7 +275,9 @@ class MMDiT(nn.Module):
         self.out_channels = in_channels * 2 if learn_sigma else in_channels
         self.patch_size = patch_size
         self.num_heads = num_heads
+        self.num_register_tokens = num_register_tokens
         self.num_classes = num_classes
+        self.num_embeddings = num_embeddings
         self.use_cond = True
 
         self.x_embedder = PatchEmbed(input_size, patch_size, in_channels, dim)
@@ -282,17 +287,16 @@ class MMDiT(nn.Module):
             num_classes, dim, class_dropout_prob, num_embeddings
         )
 
+        num_patches = self.x_embedder.num_patches
+        self.pos_embed = nn.Parameter(
+            torch.randn(1, self.num_embeddings + num_patches, dim)
+        )
+
         # register tokens
         self.register_tokens = (
             nn.Parameter(torch.randn(num_register_tokens, dim))
             if num_register_tokens > 0
             else None
-        )
-
-        num_patches = self.x_embedder.num_patches
-        # Will use fixed sin-cos embedding:
-        self.pos_embed = nn.Parameter(
-            torch.zeros(1, num_patches, dim), requires_grad=False
         )
 
         self.blocks = nn.ModuleList(
@@ -313,10 +317,7 @@ class MMDiT(nn.Module):
         self.apply(_basic_init)
 
         # Initialize (and freeze) pos_embed by sin-cos embedding:
-        pos_embed = get_2d_sincos_pos_embed(
-            self.pos_embed.shape[-1], int(self.x_embedder.num_patches**0.5)
-        )
-        self.pos_embed.data.copy_(torch.from_numpy(pos_embed).float().unsqueeze(0))
+        nn.init.trunc_normal_(self.pos_embed, std=0.02)
 
         # Initialize patch_embed like nn.Linear (instead of nn.Conv2d):
         w = self.x_embedder.proj.weight.data
@@ -341,10 +342,14 @@ class MMDiT(nn.Module):
             nn.init.constant_(block.adaLN_modulation_2[-1].bias, 0)
 
         # Zero-out output layers:
-        nn.init.constant_(self.final_layer.adaLN_modulation[-1].weight, 0)
-        nn.init.constant_(self.final_layer.adaLN_modulation[-1].bias, 0)
+        nn.init.constant_(self.final_layer.modulation[-1].weight, 0)
+        nn.init.constant_(self.final_layer.modulation[-1].bias, 0)
         nn.init.constant_(self.final_layer.linear.weight, 0)
         nn.init.constant_(self.final_layer.linear.bias, 0)
+
+        # Initialize register tokens:
+        if self.register_tokens is not None:
+            nn.init.normal_(self.register_tokens, std=1e-6)
 
     def unpatchify(self, x):
         """
@@ -361,15 +366,21 @@ class MMDiT(nn.Module):
         imgs = x.reshape(shape=(x.shape[0], c, h * p, h * p))
         return imgs
 
-    def pe_selection_index_based_on_dim(self, h, w):
-        h_p, w_p = h // self.patch_size, w // self.patch_size
-        original_pe_indexes = torch.arange(self.positional_encoding.shape[1])
-        original_pe_indexes = original_pe_indexes.view(self.h_max, self.w_max)
-        original_pe_indexes = original_pe_indexes[
-            self.h_max // 2 - h_p // 2 : self.h_max // 2 + h_p // 2,
-            self.w_max // 2 - w_p // 2 : self.w_max // 2 + w_p // 2,
-        ]
-        return original_pe_indexes.flatten()
+    def prepare_tokens(self, x, y):
+        x = self.x_embedder(x)  # (N, T, D), where T = H * W / patch_size ** 2
+        x = x + self.pos_embed[:, self.num_embeddings :]
+
+        y, global_y = self.y_embedder(y, self.training)  # (N, D)
+        y = y + self.pos_embed[:, : self.num_embeddings]
+
+        if self.register_tokens is not None:
+            # repeat register token
+            r = repeat(self.register_tokens, "n d -> b n d", b=x.shape[0])
+
+            # pack cls token and register token
+            x = torch.cat([r, x], dim=1)
+
+        return x, y, global_y
 
     def forward(self, x, t, y):
         """
@@ -379,29 +390,19 @@ class MMDiT(nn.Module):
         y: (N,) tensor of class labels
         """
         use_register_tokens = self.register_tokens is not None
-        H, W = x.shape[-2:]
-        x = (
-            self.x_embedder(x) + self.pos_embed
-        )  # (N, T, D), where T = H * W / patch_size ** 2
 
-        if use_register_tokens:
-            # repeat register token
-            r = repeat(self.register_tokens, "n d -> b n d", b=x.shape[0])
-
-            # pack cls token and register token
-            x, ps = pack([x, r], "b * d ")
+        x, y, global_y = self.prepare_tokens(x, y)
 
         t = self.t_embedder(t)  # (N, D)
         global_c = t
-        y, global_y = self.y_embedder(y, self.training)  # (N, D)
         global_c = global_c + global_y  # (N, D)
 
-        for i, block in enumerate(self.blocks):
+        for block in self.blocks:
             x, y = block(x, y, global_c)  # (N, T, D)
 
         # unpack cls token and register token
         if use_register_tokens:
-            x, _ = unpack(x, ps, "b * d")
+            x = x[:, self.num_register_tokens :]
 
         x = self.final_layer(x, global_c)  # (N, T, patch_size ** 2 * out_channels)
         x = self.unpatchify(x)  # (N, out_channels, H, W)
@@ -419,7 +420,7 @@ class MMDiT(nn.Module):
         return out
 
 
-class MMDiTwithPretrainedEmbedding(MMDiT):
+class IN1KMMDiT(MMDiT):
     def __init__(
         self,
         embed_path,
@@ -433,6 +434,7 @@ class MMDiTwithPretrainedEmbedding(MMDiT):
         num_register_tokens=0,
         class_dropout_prob=0.1,
         num_classes=1000,
+        num_embeddings=49,
         learn_sigma=False,
     ):
         super().__init__(
@@ -446,6 +448,7 @@ class MMDiTwithPretrainedEmbedding(MMDiT):
             num_register_tokens,
             class_dropout_prob,
             num_classes,
+            num_embeddings,
             learn_sigma,
         )
         self.y_embedder = IN1KEmbedder(dim, embed_path, class_dropout_prob)
@@ -454,59 +457,3 @@ class MMDiTwithPretrainedEmbedding(MMDiT):
         nn.init.normal_(self.y_embedder.proj.weight, std=0.02)
         nn.init.normal_(self.y_embedder.mlp[0].weight, std=0.02)
         nn.init.normal_(self.y_embedder.mlp[2].weight, std=0.02)
-
-
-# Positional embedding from:
-# https://github.com/facebookresearch/mae/blob/main/util/pos_embed.py
-
-
-def get_2d_sincos_pos_embed(embed_dim, grid_size, cls_token=False, extra_tokens=0):
-    """
-    grid_size: int of the grid height and width
-    return:
-    pos_embed: [grid_size*grid_size, embed_dim] or [1+grid_size*grid_size, embed_dim] (w/ or w/o cls_token)
-    """
-    grid_h = np.arange(grid_size, dtype=np.float32)
-    grid_w = np.arange(grid_size, dtype=np.float32)
-    grid = np.meshgrid(grid_w, grid_h)  # here w goes first
-    grid = np.stack(grid, axis=0)
-
-    grid = grid.reshape([2, 1, grid_size, grid_size])
-    pos_embed = get_2d_sincos_pos_embed_from_grid(embed_dim, grid)
-    if cls_token and extra_tokens > 0:
-        pos_embed = np.concatenate(
-            [np.zeros([extra_tokens, embed_dim]), pos_embed], axis=0
-        )
-    return pos_embed
-
-
-def get_2d_sincos_pos_embed_from_grid(embed_dim, grid):
-    assert embed_dim % 2 == 0
-
-    # use half of dimensions to encode grid_h
-    emb_h = get_1d_sincos_pos_embed_from_grid(embed_dim // 2, grid[0])  # (H*W, D/2)
-    emb_w = get_1d_sincos_pos_embed_from_grid(embed_dim // 2, grid[1])  # (H*W, D/2)
-
-    emb = np.concatenate([emb_h, emb_w], axis=1)  # (H*W, D)
-    return emb
-
-
-def get_1d_sincos_pos_embed_from_grid(embed_dim, pos):
-    """
-    embed_dim: output dimension for each position
-    pos: a list of positions to be encoded: size (M,)
-    out: (M, D)
-    """
-    assert embed_dim % 2 == 0
-    omega = np.arange(embed_dim // 2, dtype=np.float64)
-    omega /= embed_dim / 2.0
-    omega = 1.0 / 10000**omega  # (D/2,)
-
-    pos = pos.reshape(-1)  # (M,)
-    out = np.einsum("m,d->md", pos, omega)  # (M, D/2), outer product
-
-    emb_sin = np.sin(out)  # (M, D/2)
-    emb_cos = np.cos(out)  # (M, D/2)
-
-    emb = np.concatenate([emb_sin, emb_cos], axis=1)  # (M, D)
-    return emb

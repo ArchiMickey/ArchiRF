@@ -1,3 +1,8 @@
+name: imagenet-lrf-in1kmmdit
+project_name: MMDiT
+ckpt_path: null
+
+
 hparams:
   seed: 42
   batch_size: 256
@@ -7,7 +12,7 @@ hparams:
   n_steps: 1000000
   # n_steps: 1
   use_ema: true
-  ema_decay: 0.99 
+  ema_decay: 0.9999
 
 datamodule:
   _partial_: true
@@ -23,15 +28,16 @@ model:
   image_size: 8
   logit_normal_sampling_t: true
   net:
-    _target_: modules.networks_mmdit.MMDiTwithPretrainedEmbedding
+    _target_: modules.networks_mmdit.IN1KMMDiT
     embed_path: embeddings/in1k_embed-efficientnet_lite0.pth
     input_size: ${model.image_size}
     patch_size: 1
     in_channels: ${model.channels}
-    dim: 384
+    dim: 512
     depth: 12
     num_heads: 8
     num_classes: 1000
+    num_register_tokens: 4
 
 optimizer:
   _partial_: true
@@ -61,7 +67,7 @@ trainer:
   fid_cfg_scale: 5.0
   num_fid_samples: 50000
   logger_kwargs:
-    project_name: RF-Experiments
+    project_name: ${project_name}
     init_kwargs:
       wandb:
-        name: imagenet-lrf-mmdit-pretrained_embed
+        name: ${name}
