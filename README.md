@@ -1,10 +1,13 @@
 # ArchiRF
 
 <p align="center">
-  <img width="512" height="512" src="assets/imagenet-mmdit-rf.gif">
+  <img width="768" height="768" src="assets/samples_400000_cfg5.0.png">
 </p>
 
 This is a self-interested project to create a Rectified Flow Model for my own experiments. These experiments can be meaningless, but I hope to learn something from them. Specifically, I want to learn how to implement a denoising diffusion probabilistic model(DDPM) and Rectified Flow which simplifies the process of diffusion and produces better results. Besides, I also implement several techniques introduced in some papers to improve the performance of the model. The whole project is trained using a single RTX 4090 GPU.
+
+## Update
+[2024-08-05] I have retrained a new autoencoder and a MMDiT with pretrained features from efficientnet-lite0. Less multimodal blocks are used in the new MMDiT model. You can refer to `config/imagenet-lrf-in1kmmdit.yaml`.
 
 ## Content
 This is a part mentioning what I have done in this project. I may keep updating this part to record my process.
@@ -39,6 +42,8 @@ I have implemented the MMDiT network. Following the paper, I made several change
   This can prevent explosion in the attention logits.
 2. Logit-Normal Sampling for $t$ \
 I use the logit-normal distribution to sample $t$ in the rectified flow model. This is said to be better then the uniform distribution.
+3. Less multimodal blocks \
+From aura flow, less multimodal blocks can improve the performance of the model with less computational cost.
 
 However, with limited computational resources, I can't train a text-to-image model. I use two class embeddings to simulate the text embeddings. However, I found out training the embeddings is very hard given a large number of classes in ImageNet. According to the StyleGAN-XL paper, it is possible to use pretrained class embeddings from a pretrained image classification model(Efficientnet-lite0 in their paper). They pool the image features at the last layer to act as class embeddings. I may try this method in the future.
 
@@ -67,9 +72,9 @@ According to SD3 paper, the larger output latent channels can produce better ima
 ### Latent Rectified Flow (Still Training?)
 After all, I can use the trained autoencoder to train a latent rectified model. I found that training a latent diffusion/rf model is way harder than training one on pixel space.
 
-Samples of generating some classes in ImageNet with MMDiT and Latent RF:
+Animation of generating some classes in ImageNet with MMDiT and Latent RF:
 <p align="center">
-  <img width="512" height="512" src="assets/imagenet-mmdit-rf.png">
+  <img width="768" height="768" src="assets/samples_400000_cfg5.0.gif">
 </p>
 
 ## Train a model
