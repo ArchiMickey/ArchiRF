@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 import numpy as np
 import math
-from timm.models.vision_transformer import PatchEmbed, Mlp
+from timm.models.vision_transformer import PatchEmbed, Mlp, Attention
 import torch.nn.functional as F
 from typing import Tuple
 from functools import partial
@@ -17,6 +17,57 @@ except ImportError:
 def modulate(x, scale, shift):
     return x * (1 + scale.unsqueeze(1)) + shift.unsqueeze(1)
 
+
+# Positional embedding from:
+# https://github.com/facebookresearch/mae/blob/main/util/pos_embed.py
+
+def get_2d_sincos_pos_embed(embed_dim, grid_size, cls_token=False, extra_tokens=0):
+    """
+    grid_size: int of the grid height and width
+    return:
+    pos_embed: [grid_size*grid_size, embed_dim] or [1+grid_size*grid_size, embed_dim] (w/ or w/o cls_token)
+    """
+    grid_h = np.arange(grid_size, dtype=np.float32)
+    grid_w = np.arange(grid_size, dtype=np.float32)
+    grid = np.meshgrid(grid_w, grid_h)  # here w goes first
+    grid = np.stack(grid, axis=0)
+
+    grid = grid.reshape([2, 1, grid_size, grid_size])
+    pos_embed = get_2d_sincos_pos_embed_from_grid(embed_dim, grid)
+    if cls_token and extra_tokens > 0:
+        pos_embed = np.concatenate([np.zeros([extra_tokens, embed_dim]), pos_embed], axis=0)
+    return pos_embed
+
+def get_2d_sincos_pos_embed_from_grid(embed_dim, grid):
+    assert embed_dim % 2 == 0
+
+    # use half of dimensions to encode grid_h
+    emb_h = get_1d_sincos_pos_embed_from_grid(embed_dim // 2, grid[0])  # (H*W, D/2)
+    emb_w = get_1d_sincos_pos_embed_from_grid(embed_dim // 2, grid[1])  # (H*W, D/2)
+
+    emb = np.concatenate([emb_h, emb_w], axis=1) # (H*W, D)
+    return emb
+
+
+def get_1d_sincos_pos_embed_from_grid(embed_dim, pos):
+    """
+    embed_dim: output dimension for each position
+    pos: a list of positions to be encoded: size (M,)
+    out: (M, D)
+    """
+    assert embed_dim % 2 == 0
+    omega = np.arange(embed_dim // 2, dtype=np.float64)
+    omega /= embed_dim / 2.
+    omega = 1. / 10000**omega  # (D/2,)
+
+    pos = pos.reshape(-1)  # (M,)
+    out = np.einsum('m,d->md', pos, omega)  # (M, D/2), outer product
+
+    emb_sin = np.sin(out) # (M, D/2)
+    emb_cos = np.cos(out) # (M, D/2)
+
+    emb = np.concatenate([emb_sin, emb_cos], axis=1)  # (M, D)
+    return emb
 
 class TimestepEmbedder(nn.Module):
     def __init__(self, dim, nfreq=256):
@@ -85,7 +136,7 @@ class IN1KEmbedder(nn.Module):
         self.num_classes = 1000
         self.dropout_prob = dropout_prob
 
-        self.embed = nn.Parameter(torch.load(embed_path), requires_grad=False)
+        self.embed = nn.Parameter(torch.load(embed_path))
 
         self.proj = nn.Linear(1280, dim)
         self.mlp = nn.Sequential(nn.Linear(1280, dim), nn.SiLU(), nn.Linear(dim, dim))
@@ -195,6 +246,31 @@ class DoubleAttention(nn.Module):
         return x, c
 
 
+class DiTBlock(nn.Module):
+    def __init__(self, dim, num_heads, mlp_ratio=4.0):
+        super().__init__()
+        self.norm1 = nn.LayerNorm(dim, elementwise_affine=False, eps=1e-6)
+        self.attn = Attention(dim, num_heads=num_heads, qkv_bias=True, qk_norm=True, norm_layer=RMSNorm)
+        self.norm2 = nn.LayerNorm(dim, elementwise_affine=False, eps=1e-6)
+        mlp_dim = int(dim * mlp_ratio)
+        approx_gelu = lambda: nn.GELU(approximate="tanh")
+        self.mlp = Mlp(
+            in_features=dim, hidden_features=mlp_dim, act_layer=approx_gelu, drop=0
+        )
+        self.adaLN_modulation = nn.Sequential(nn.SiLU(), nn.Linear(dim, 6 * dim))
+
+    def forward(self, x, c):
+        shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = (
+            self.adaLN_modulation(c).chunk(6, dim=-1)
+        )
+        x = x + gate_msa.unsqueeze(1) * self.attn(
+            modulate(self.norm1(x), scale_msa, shift_msa)
+        )
+        x = x + gate_mlp.unsqueeze(1) * self.mlp(
+            modulate(self.norm2(x), scale_mlp, shift_mlp)
+        )
+        return x
+
 class MMDiTBlock(nn.Module):
     def __init__(self, dim, num_heads, mlp_ratio=4.0):
         super().__init__()
@@ -243,12 +319,13 @@ class MMDiTBlock(nn.Module):
 class FinalLayer(nn.Module):
     def __init__(self, dim, patch_size, out_dim):
         super().__init__()
+        self.norm_final = nn.LayerNorm(dim, elementwise_affine=False, eps=1e-6)
         self.linear = nn.Linear(dim, patch_size * patch_size * out_dim)
         self.modulation = nn.Sequential(nn.SiLU(), nn.Linear(dim, 2 * dim))
 
     def forward(self, x, c):
         shift, scale = self.modulation(c).chunk(2, dim=-1)
-        x = modulate(x, shift, scale)
+        x = modulate(self.norm_final(x), shift, scale)
         x = self.linear(x)
         return x
 
@@ -260,7 +337,8 @@ class MMDiT(nn.Module):
         patch_size=2,
         in_channels=4,
         dim=1152,
-        depth=28,
+        depth=14,
+        depth_single_blocks=14,
         num_heads=16,
         mlp_ratio=4.0,
         num_register_tokens=0,
@@ -289,7 +367,7 @@ class MMDiT(nn.Module):
 
         num_patches = self.x_embedder.num_patches
         self.pos_embed = nn.Parameter(
-            torch.randn(1, self.num_embeddings + num_patches, dim)
+            torch.zeros(1, self.num_embeddings + num_patches, dim), requires_grad=False
         )
 
         # register tokens
@@ -299,8 +377,11 @@ class MMDiT(nn.Module):
             else None
         )
 
-        self.blocks = nn.ModuleList(
+        self.double_blocks = nn.ModuleList(
             [MMDiTBlock(dim, num_heads, mlp_ratio) for _ in range(depth)]
+        )
+        self.blocks = nn.ModuleList(
+            [DiTBlock(dim, num_heads, mlp_ratio) for _ in range(depth_single_blocks)]
         )
         self.final_layer = FinalLayer(dim, patch_size, self.out_channels)
 
@@ -317,7 +398,10 @@ class MMDiT(nn.Module):
         self.apply(_basic_init)
 
         # Initialize (and freeze) pos_embed by sin-cos embedding:
-        nn.init.trunc_normal_(self.pos_embed, std=0.02)
+        pos_embed = get_2d_sincos_pos_embed(self.pos_embed.shape[-1], 7)
+        self.pos_embed[:, : self.num_embeddings].data.copy_(torch.from_numpy(pos_embed).float().unsqueeze(0))
+        pos_embed = get_2d_sincos_pos_embed(self.pos_embed.shape[-1], int(self.x_embedder.num_patches ** 0.5))
+        self.pos_embed[:, self.num_embeddings :].data.copy_(torch.from_numpy(pos_embed).float().unsqueeze(0))
 
         # Initialize patch_embed like nn.Linear (instead of nn.Conv2d):
         w = self.x_embedder.proj.weight.data
@@ -335,11 +419,14 @@ class MMDiT(nn.Module):
         nn.init.normal_(self.t_embedder.mlp[2].weight, std=0.02)
 
         # Zero-out adaLN modulation layers in DiT blocks:
-        for block in self.blocks:
+        for block in self.double_blocks:
             nn.init.constant_(block.adaLN_modulation_1[-1].weight, 0)
             nn.init.constant_(block.adaLN_modulation_1[-1].bias, 0)
             nn.init.constant_(block.adaLN_modulation_2[-1].weight, 0)
             nn.init.constant_(block.adaLN_modulation_2[-1].bias, 0)
+        for block in self.blocks:
+            nn.init.constant_(block.adaLN_modulation[-1].weight, 0)
+            nn.init.constant_(block.adaLN_modulation[-1].bias, 0)
 
         # Zero-out output layers:
         nn.init.constant_(self.final_layer.modulation[-1].weight, 0)
@@ -397,9 +484,16 @@ class MMDiT(nn.Module):
         global_c = t
         global_c = global_c + global_y  # (N, D)
 
-        for block in self.blocks:
+        for block in self.double_blocks:
             x, y = block(x, y, global_c)  # (N, T, D)
-
+        
+        x = torch.cat([y, x], dim=1)
+        
+        for block in self.blocks:
+            x = block(x, global_c)
+        
+        x = x[:, y.shape[1] :]
+        
         # unpack cls token and register token
         if use_register_tokens:
             x = x[:, self.num_register_tokens :]
@@ -428,7 +522,8 @@ class IN1KMMDiT(MMDiT):
         patch_size=2,
         in_channels=4,
         dim=1152,
-        depth=28,
+        depth=14,
+        depth_single_blocks=14,
         num_heads=16,
         mlp_ratio=4.0,
         num_register_tokens=0,
@@ -443,6 +538,7 @@ class IN1KMMDiT(MMDiT):
             in_channels,
             dim,
             depth,
+            depth_single_blocks,
             num_heads,
             mlp_ratio,
             num_register_tokens,

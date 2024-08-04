@@ -18,7 +18,7 @@ datamodule:
   _partial_: true
   _target_: data.data_utils.ExperimentDataModule
   dataset_name: imagenet
-  root: /mnt/g/ImageNet
+  root: /workspace/imagenet
   image_size: 64
   num_workers: 12
 
@@ -33,10 +33,10 @@ model:
     input_size: ${model.image_size}
     patch_size: 1
     in_channels: ${model.channels}
-    dim: 512
-    depth: 12
-    num_heads: 8
-    num_classes: 1000
+    dim: 768
+    depth: 4
+    depth_single_blocks: 8
+    num_heads: 12
     num_register_tokens: 4
 
 optimizer:

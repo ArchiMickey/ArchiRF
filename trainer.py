@@ -200,7 +200,7 @@ class Trainer:
                     self.model.eval()
                     with self.ema_scope():
                         with self.accelerator.autocast():
-                            fid_score = self.fid_scorer.fid_score(self.fid_cfg_scale)
+                            fid_score = self.fid_scorer.fid_score(self.sampling_steps, self.fid_cfg_scale)
                     self.save_ckpt()
                     self.model.train()
 

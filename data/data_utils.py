@@ -100,7 +100,6 @@ class ExperimentDataModule:
             num_workers=self.num_workers,
             pin_memory=True,
         )
-        dl = cycle(dl)
         return dl
 class LatentImageNetDataset(Dataset):
     def __init__(self, root):

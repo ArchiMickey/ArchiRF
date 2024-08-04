@@ -68,19 +68,19 @@ class FIDEvaluation:
             self.print_fn("Dataset stats loaded from disk.")
             ckpt.close()
         except OSError:
-            num_batches = int(math.ceil(self.n_samples / self.batch_size))
             stacked_real_features = []
             self.print_fn(
                 f"Stacking Inception features for {self.n_samples} samples from the real dataset."
             )
-            for _ in tqdm(range(num_batches)):
-                try:
-                    real_samples = next(self.dl)["img"]
-                except StopIteration:
-                    break
+            num_batches = 0
+            for batch in tqdm(self.dl):
+                real_samples = batch["img"]
                 real_samples = real_samples.to(self.device)
                 real_features = self.calculate_inception_features(real_samples)
                 stacked_real_features.append(real_features)
+                num_batches += len(batch)
+                if num_batches >= self.n_samples:
+                    break
             stacked_real_features = (
                 torch.cat(stacked_real_features, dim=0).float().cpu().numpy()
             )
@@ -92,21 +92,30 @@ class FIDEvaluation:
         self.dataset_stats_loaded = True
 
     @torch.inference_mode()
-    def fid_score(self, cfg_scale=1.0):
+    def fid_score(self, sampling_steps=50, cfg_scale=1.0):
         if not self.dataset_stats_loaded:
             self.load_or_precalc_dataset_stats()
         self.sampler.eval()
-        batches = num_to_groups(self.n_samples, self.batch_size)
         stacked_fake_features = []
         self.print_fn(
             f"Stacking Inception features for {self.n_samples} generated samples with cfg scale = {cfg_scale}."
         )
-        for batch in tqdm(batches):
-            fake_samples = self.sampler.fid_sample(
-                batch, self.device, cfg_scale
+        num_batches = 0
+        for batch in tqdm(self.dl):
+            if "label" in batch:
+                classes = batch["label"]
+                fake_samples = self.sampler.cond_sample(
+                classes, self.device, sampling_steps, cfg_scale
             )
+            else:
+                fake_samples = self.sampler.sample(
+                    len(batch), self.device, sampling_steps, cfg_scale
+                )
             fake_features = self.calculate_inception_features(fake_samples)
             stacked_fake_features.append(fake_features.to(torch.float))
+            num_batches += len(fake_samples)
+            if num_batches >= self.n_samples:
+                break
         stacked_fake_features = torch.cat(stacked_fake_features, dim=0).cpu().numpy()
         m1 = np.mean(stacked_fake_features, axis=0)
         s1 = np.cov(stacked_fake_features, rowvar=False)

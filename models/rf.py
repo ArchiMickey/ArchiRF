@@ -98,14 +98,6 @@ class RectifiedFlow(nn.Module):
             return z, all_steps
         return z
 
-    def fid_sample(self, batch_size, device, cfg_scale=5.0):
-        if self.use_cond:
-            y = torch.randint(0, self.net.num_classes, (batch_size,), device=device)
-
-            return self.cond_sample(y, device, cfg_scale=cfg_scale)
-        else:
-            return self.sample(batch_size, device)
-
 
 class LatentRectifiedFlow(RectifiedFlow):
     def __init__(
