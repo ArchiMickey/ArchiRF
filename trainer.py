@@ -137,8 +137,8 @@ class Trainer:
 
         self.opt.load_state_dict(state_dict["opt"])
         self.step = state_dict["step"]
-        if accelerator.scalar is not None:
-            accelerator.scaler.load_state_dict(state_dict["scalar"])
+        if accelerator.sacler is not None:
+            accelerator.scaler.load_state_dict(state_dict["sacler"])
         if self.use_ema:
             self.model_ema.load_state_dict(state_dict["model_ema"])
 
