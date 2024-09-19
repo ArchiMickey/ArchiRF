@@ -68,21 +68,12 @@ class LabelEmbedder(nn.Module):
         return embeddings
 
 
-class RMSNorm(nn.Module):
-    def __init__(self, dim):
-        super().__init__()
-        self.scale = dim**0.5
-        self.g = nn.Parameter(torch.ones(1))
-
-    def forward(self, x):
-        return F.normalize(x, dim=-1) * self.scale * self.g
-
 class DiTBlock(nn.Module):
     def __init__(self, dim, num_heads, mlp_ratio=4.0):
         super().__init__()
-        self.norm1 = RMSNorm(dim)
-        self.attn = Attention(dim, num_heads=num_heads, qkv_bias=True, qk_norm=True, norm_layer=RMSNorm)
-        self.norm2 = RMSNorm(dim)
+        self.norm1 = nn.LayerNorm(dim, elementwise_affine=False, eps=1e-6)
+        self.attn = Attention(dim, num_heads=num_heads, qkv_bias=True)
+        self.norm2 = nn.LayerNorm(dim, elementwise_affine=False, eps=1e-6)
         mlp_dim = int(dim * mlp_ratio)
         approx_gelu = lambda: nn.GELU(approximate="tanh")
         self.mlp = Mlp(
@@ -106,7 +97,7 @@ class DiTBlock(nn.Module):
 class FinalLayer(nn.Module):
     def __init__(self, dim, patch_size, out_dim):
         super().__init__()
-        self.norm_final = RMSNorm(dim)
+        self.norm_final = nn.LayerNorm(dim, elementwise_affine=False, eps=1e-6)
         self.linear = nn.Linear(dim, patch_size * patch_size * out_dim)
         self.adaLN_modulation = nn.Sequential(nn.SiLU(), nn.Linear(dim, 2 * dim))
 
@@ -126,7 +117,6 @@ class DiT(nn.Module):
         depth=28,
         num_heads=16,
         mlp_ratio=4.0,
-        num_register_tokens=4,
         class_dropout_prob=0.1,
         num_classes=1000,
         learn_sigma=False,
@@ -144,11 +134,6 @@ class DiT(nn.Module):
         
         self.use_cond = num_classes is not None
         self.y_embedder = LabelEmbedder(num_classes, dim, class_dropout_prob) if self.use_cond else None
-        
-        #register tokens
-        self.register_tokens = nn.Parameter(
-            torch.randn(num_register_tokens, dim)
-        )
         
         num_patches = self.x_embedder.num_patches
         # Will use fixed sin-cos embedding:
@@ -221,15 +206,6 @@ class DiT(nn.Module):
         """
         H, W = x.shape[-2:]
         x = self.x_embedder(x) + self.pos_embed  # (N, T, D), where T = H * W / patch_size ** 2
-        #repeat register token
-        r = repeat(
-            self.register_tokens, 
-            'n d -> b n d', 
-            b=x.shape[0]
-        )
-
-        #pack cls token and register token
-        x, ps = pack([x, r], 'b * d ')
         
         t = self.t_embedder(t)                   # (N, D)
         c = t
@@ -240,9 +216,6 @@ class DiT(nn.Module):
         for i, block in enumerate(self.blocks):
             x = block(x, c)                      # (N, T, D)
             
-        #unpack cls token and register token
-        x, _ = unpack(x, ps, 'b * d')
-        
         x = self.final_layer(x, c)                # (N, T, patch_size ** 2 * out_channels)
         x = self.unpatchify(x)                   # (N, out_channels, H, W)
         return x
