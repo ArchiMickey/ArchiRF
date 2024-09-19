@@ -146,7 +146,7 @@ class GANTrainer:
         self.opt_d.load_state_dict(state_dict["opt_d"])
         self.step = state_dict["step"]
         if accelerator.scaler is not None:
-            accelerator.scaler.load_state_dict(state_dict["scalar"])
+            accelerator.scaler.load_state_dict(state_dict["scaler"])
         if self.use_ema:
             self.generator_ema.load_state_dict(state_dict["generator_ema"])
         
